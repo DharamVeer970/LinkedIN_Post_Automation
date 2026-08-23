@@ -1,0 +1,21 @@
+
+# NEVER commit credentials or local secrets
+.env
+
+# Logs + Python cache from local runs
+logs/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Generated images + binary ChromaDB (regenerated each run; safe to ignore)
+images/
+post_history_db/
+
+# But posts_history.json IS tracked (git-friendly; re-seeds ChromaDB on GitHub)
+!posts_history.json
+
+# OS junk
+.DS_Store
+Thumbs.db
