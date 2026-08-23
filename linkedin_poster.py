@@ -6,16 +6,12 @@ import os
 import requests
 from dotenv import load_dotenv
 
-# All config is loaded from .env - no hardcoded credentials here.
 load_dotenv()
+
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")  # Must match the callback set on the LinkedIn developer portal.
-LINKEDIN_API_VERSION = os.getenv("LINKEDIN_API_VERSION")  # LinkedIn-Version header, updated monthly by LinkedIn.
-
-if not CLIENT_ID or not CLIENT_SECRET:
-    raise ValueError("Set CLIENT_ID and CLIENT_SECRET in your .env file")
-
+REDIRECT_URI ="http://localhost:8000/callback"
+LINKEDIN_API_VERSION = "202608"  # LinkedIn-Version header, updated monthly by LinkedIn.
 
 def _check(resp: requests.Response) -> None:
     """Print the real LinkedIn error message instead of guessing on failure."""
@@ -116,6 +112,8 @@ def create_post(access_token: str, person_urn: str, text: str, image_urn: str) -
 
 if __name__ == "__main__":
     # One-time authorization flow - run these lines only once.
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise ValueError("Set CLIENT_ID and CLIENT_SECRET in your .env file first")
     print("Authorize here:", get_authorization_url())
     auth_code = input("Paste the 'code' from the redirect URL: ")
     token = exchange_code_for_token(auth_code)
