@@ -40,8 +40,8 @@ LinkedIn_Post_Automation/
 ## 🔄 Pipeline Flow (LangGraph)
 
 ```
-pick_topic ──► generate_content ──► critique_post ──┐
-                              ▲                     │
+pick_topic ──► generate_content ──► critique_post ───┐
+                              ▲                       │
                          revise_content ◄───────────┘
                               │ (score ≥ 7 or 2 revisions)
                               ▼
