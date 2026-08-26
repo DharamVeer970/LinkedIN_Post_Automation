@@ -41,8 +41,8 @@ LinkedIn_Post_Automation/
 
 ```
 pick_topic ──► generate_content ──► critique_post ───┐
-                              ▲                       │
-                         revise_content ◄───────────┘
+                              ▲                      │
+                         revise_content ◄────────────┘
                               │ (score ≥ 7 or 2 revisions)
                               ▼
                   generate_image_prompt (Gemini picks template A-E)
