@@ -68,8 +68,7 @@ if not GEMINI_API_KEY or not LINKEDIN_TOKEN:
     raise ValueError("Set GEMINI_API_KEY and LINKEDIN_TOKEN in your .env file (see .env.example)")
 
 # ---- ChromaDB setup — old posts are stored here for uniqueness checking ----
-# NOTE: chroma.sqlite3 + .bin files are NOT git-friendly and get lost on the
-# ephemeral GitHub Actions runner. So we ALSO persist posts as plain text in
+# NOTE: chroma.sqlite3 + .bin files are NOT git-friendly and get lost on the ephemeral GitHub Actions runner.
 # posts_history.json (git-friendly) and re-seed ChromaDB from it each startup.
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posts_history.json")
 

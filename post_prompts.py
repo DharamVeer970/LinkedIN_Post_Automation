@@ -25,13 +25,18 @@ TOPIC_DOMAINS = {
             "Fine-tuning vs RAG: when to use which",
             "Evaluating LLM applications in production",
             "The hidden cost of LLM API latency and how to cut it",
-            "Re-ranking vs RAG: why retrieval quality matters most",
+            "Re-ranking in RAG: why retrieval quality matters most",
             "Model distillation: training smaller models from big ones",
             "Why context engineering beats cleverer prompting",
             "AI code assistants: where they shine and where they lie",
             "Open-source models vs closed APIs: real pricing math",
             "Structured outputs from LLMs: JSON mode done right",
-            "Current AI infrastructure: GPUs, inference, and cost realities",
+            "AI infrastructure economics: GPUs, inference, and cost realities",
+            "The future of AI agents: from tools to autonomous systems",
+            "Multi-modal agents: AI that can see, hear, and act",
+            "Tool use: how LLMs call external tools and APIs",
+            "Multi-agent orchestration: coordinating agents for complex tasks",
+            "The ethics of AI agents: responsibility, bias, and safety",
         ],
     },
     "Software & Automation": {
@@ -51,6 +56,11 @@ TOPIC_DOMAINS = {
             "Git workflows that save your team hours every week",
             "From dev to deploy: automating your entire release pipeline",
             "Open source vs SaaS for developers: honest trade-offs",
+            "Automation in the cloud: serverless, containers, and orchestration",
+            "Measuring automation ROI: impact vs. maintenance costs",
+            "Self-healing systems: when software fixes itself in production",
+            "Unit testing vs integration testing: what to automate and when",
+            "Debugging strategies for complex automated systems",
         ],
     },
 
@@ -73,6 +83,8 @@ TOPIC_DOMAINS = {
             "Production LLM monitoring: tokens, costs, and drift",
             "Vector databases: which one fits your stack",
             "New inference engines: how models get faster without losing quality",
+            "The rise of multi-modal models: text, image, and beyond",
+            "Model compression and quantization: making giants run on laptops",
         ],
     },
     "Startups & Business": {
@@ -87,6 +99,7 @@ TOPIC_DOMAINS = {
             "Pricing psychology every founder should know",
             "How solo founders ship faster than big teams",
             "Customer interviews: asking questions that reveal truth",
+            "The lean startup method: build, measure, learn",
         ],
     },
     "Productivity & Career": {
@@ -100,6 +113,7 @@ TOPIC_DOMAINS = {
             "Managing energy, not time: a practical system",
             "Saying no: the highest-leverage skill at work",
             "From individual contributor to leader: real lessons",
+            "The 80/20 rule in career growth: what to focus on",
         ],
     },
     "Psychology & Mind": {
@@ -111,6 +125,8 @@ TOPIC_DOMAINS = {
             "The dopamine trap: phones, feeds and focus",
             "Cognitive biases that shape your daily choices",
             "How curiosity rewires the brain for learning",
+            "The science of motivation: intrinsic vs extrinsic",
+            "Mindfulness and productivity: separating hype from science",
         ],
     },
     "Science & Future": {
@@ -124,6 +140,8 @@ TOPIC_DOMAINS = {
             "Longevity science: slowing biological aging",
             "Quantum computing myths vs reality",
             "Synthetic biology: programming living cells",
+            "The future of human-machine symbiosis",
+            "The ethics of AI: navigating the moral landscape",
         ],
     },
     "Design & Creativity": {
@@ -137,6 +155,8 @@ TOPIC_DOMAINS = {
             "Creativity is a process, not a lightning strike",
             "Minimalism in design: less, but better",
             "How constraints make designers more creative",
+            "The tool-agnostic designer: why process beats software",
+            "Color theory for non-designers: practical applications",
         ],
     },
     "Money & Investing": {
@@ -148,6 +168,8 @@ TOPIC_DOMAINS = {
             "Skills that pay forever in any economy",
             "The psychology of spending: why we buy",
             "Side income myths vs what actually works",
+            "The FIRE movement: financial independence, retire early",
+            "In this ERA of AI, what skills will retain value?",
         ],
     },
 }
@@ -197,6 +219,20 @@ VIRAL_TEMPLATES = {
         "bold label underneath, off-white paper background, high contrast, viral billboard style, "
         "perfectly legible English"
     ),
+    "animated-image": (
+        "animated image, 6 panels in 2x3 grid, each panel with smooth transitions, "
+        "flat vector cartoon style, clean bold outlines, soft flat colors, "
+        "speech bubbles with SHORT perfectly legible English text (max 8 words per bubble), "
+        "expressive characters, with beautiful background, trending LinkedIn humor comic, "
+        "crisp vector, 8k, ultra-detailed, perfectly legible English, "
+        "showing a smooth flow of the story in each panel, with a clear beginning, middle, and end, "
+    ),
+
+    "automation-flow-diagram": (
+        "automation flow diagram, matching background with lines, don't overcrowd, clear and simple, "
+        "with a clear beginning, middle, and end, "
+        "with clearly moving cutting-edge lines connecting each process to the next, "
+    ),
 }
 
 # For pipeline compatibility and manual override - not used when agent-driven
@@ -223,11 +259,11 @@ def content_prompt(topic: str) -> str:
         "- Use emojis EXPRESSIVELY: 5-7 total, placed where they add feeling or emphasis - "
         "e.g. ⚡ for speed/energy, 💡 for insights, 🎯 for precision/takeaway, 🔥 for hype, "
         "💰 for money, 🧠 for thinking, 📉📈 for trends, ❌✅ for do/don't contrasts. "
-        "At least one emoji per paragraph, but never two in a row and never mid-word.\n"
+        "At least one emoji per paragraph where it needed, but never two in a row and never mid-word.\n"
         "- Weave 2-3 relevant hashtags naturally INSIDE the body sentences "
         "(e.g. '...thanks to #AgenticAI ...'), not all dumped at the end.\n"
         "- Include exactly ONE concrete takeaway or actionable insight.\n"
-        "- Close with a strong one-liner + emoji, then a final line of 3-4 additional hashtags "
+        "- Close with a strong one-liner + emoji, then a final line of 5-7 additional hashtags "
         "(e.g. #AI #Innovation #Growth). This final hashtag line is mandatory.\n"
         "Return only the post text, nothing else."
     )
