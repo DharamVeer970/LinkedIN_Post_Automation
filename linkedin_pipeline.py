@@ -352,7 +352,7 @@ def revise_content(state: PipelineState) -> PipelineState:
     return state
 
 
-# ---- Node 3: Generate image prompt (agent-driven, 5 templates) ----
+# ---- Node 3: Generate image prompt (agent-driven, 7 templates) ----
 def generate_image_prompt(state: PipelineState) -> PipelineState:
     state["image_prompt"] = call_gemini(image_prompt_gen(state["post_text"]))
     print(f"[image-prompt] {state['image_prompt'][:160]}...")

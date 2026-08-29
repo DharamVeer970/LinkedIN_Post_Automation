@@ -1,6 +1,6 @@
 # LinkedIn Post AI — Automated Viral Post Pipeline
 
-> Autonomous LangGraph pipeline that generates scroll-stopping LinkedIn posts (text + image) and publishes them on schedule. Text by **Gemini**, images by **Cloudflare Workers AI (FLUX.1 schnell)**, orchestration by **LangGraph**, duplicate guard by **ChromaDB**.
+> Autonomous LangGraph pipeline that generates scroll-stopping LinkedIn posts (text + image) and publishes them on schedule. Text by **Gemini (3.6 Flash + 3.1 Flash Lite fallback)**, images by **Cloudflare Workers AI (FLUX.2 klein-4b)**, orchestration by **LangGraph**, duplicate guard by **ChromaDB**.
 
 ![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-0.2-orange)
@@ -11,8 +11,8 @@
 ## ✨ What it does
 
 1. Picks a **fresh topic** from live RSS feeds + curated evergreen lists (AI, Automation, DevNews, Business, Career, Psychology, Science, Design, Money).
-2. Writes the post with **Gemini 3.6 Flash**, self-critiques & revises until `score ≥ 7/10`.
-3. Generates an **agent-driven image prompt** (Gemini picks 1 of 5 viral templates) and renders it via **Cloudflare Workers AI** (`@cf/black-forest-labs/flux-1-schnell`, SDXL fallback).
+2. Writes the post with **Gemini 3.6 Flash** (auto-fallback to 3.1 Flash Lite on quota exhaustion), self-critiques & revises until `score ≥ 7/10`.
+3. Generates an **agent-driven image prompt** (Gemini picks 1 of 5 viral templates) and renders it via **Cloudflare Workers AI** (`flux-2-klein-4b` → `flux-2-dev` → `flux-1-schnell` → SDXL fallback chain).
 4. Checks uniqueness via **ChromaDB**, publishes to LinkedIn (OAuth v2), and persists history for the next run.
 
 ---
@@ -53,7 +53,7 @@ pick_topic ──► generate_content ──► critique_post ───┐
                     unique    duplicate ──► pick_topic (retry ×3)
                          │
                          ▼
-                    generate_image (Cloudflare Workers AI, flux-1-schnell)
+                    generate_image (Cloudflare Workers AI, flux-2-klein-4b)
                          │
                          ▼
                   post_to_linkedin (upload + create post)
@@ -69,7 +69,7 @@ pick_topic ──► generate_content ──► critique_post ───┐
 | `generate_content` | `linkedin_pipeline.py:222` | `call_gemini(content_prompt())` |
 | `critique_post` | `linkedin_pipeline.py:235` | LLM critic + deterministic penalties (clichés, hashtags, emojis) |
 | `revise_content` | `linkedin_pipeline.py:289` | `call_gemini(revise_prompt())` |
-| `generate_image_prompt` | `linkedin_pipeline.py:298` | `call_gemini(image_prompt_gen())` — 5 templates |
+| `generate_image_prompt` | `linkedin_pipeline.py:298` | `call_gemini(image_prompt_gen())` — 7 templates |
 | `check_uniqueness` | `linkedin_pipeline.py:305` | `collection.query()` cosine distance |
 | `generate_image` | `linkedin_pipeline.py:325` | Cloudflare Workers AI `POST /accounts/{id}/ai/run/@cf/black-forest-labs/flux-1-schnell` |
 | `post_to_linkedin` | `linkedin_pipeline.py:362` | `linkedin_poster.py:52,62,78,86` |
@@ -91,17 +91,6 @@ Gemini chooses **exactly one** per post. Defined in `post_prompts.py:168` `VIRAL
 
 Prompt rule `post_prompts.py:286`: **every word in the image must come from the caption** — no generic labels. Ends with `crisp vector, 8k, ultra-detailed, perfectly legible English`.
 
-Generation in `linkedin_pipeline.py:325` is your exact snippet:
-
-```python
-requests.post(
-  "https://api.stability.ai/v2beta/stable-image/generate/ultra",
-  headers={"authorization": f"Bearer {STABILITY_API_KEY}", "accept": "image/*"},
-  files={"none": ''},
-  data={"prompt": full_prompt, "output_format": "webp"},
-)
-```
-
 ---
 
 ## 🚀 Quick Start (Local)
@@ -115,7 +104,6 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env — set these 5 values:
 # GEMINI_API_KEY=...
-# STABILITY_AI=sk-...
 # LINKEDIN_TOKEN=...          # from linkedin_poster.py auth flow
 # CLIENT_ID=... / CLIENT_SECRET=...  # LinkedIn Developer App
 
@@ -145,7 +133,7 @@ pillow>=10.0
 
 | Var | Source | Required | Notes |
 |-----|--------|----------|-------|
-| `GEMINI_API_KEY` | https://aistudio.google.com/apikey | ✅ | Gemini 3.6 Flash (`linkedin_pipeline.py:55`) |
+| `GEMINI_API_KEY` | https://aistudio.google.com/apikey | ✅ | Gemini 3.6 Flash + 3.1 Flash Lite fallback (`linkedin_pipeline.py:67`) |
 | `CLOUDFLARE_ACCOUNT_ID` | https://dash.cloudflare.com (Workers & Pages → sidebar) | ✅ | Cloudflare account ID |
 | `CLOUDFLARE_API_KEY` | https://dash.cloudflare.com/profile/api-tokens | ✅ | API token with **Workers AI: Edit** permission. Code reads both in `linkedin_pipeline.py:58` |
 | `LINKEDIN_TOKEN` | `linkedin_poster.py:26` OAuth | ✅ | ~60 days validity |
@@ -195,7 +183,7 @@ All prompts & domains live in **`post_prompts.py`** — edit that file only:
 | `Cloudflare 429: daily free allocation of neurons` | Workers AI free tier = 10,000 neurons/day (resets midnight PT). Each image costs neurons; QA retries cost more. Wait for reset or upgrade to Workers Paid |
 | `Not authorized / Invalid token` | LinkedIn token expired (~60d). Re-run `python linkedin_poster.py` and update `.env` + GitHub Secret `LINKEDIN_TOKEN` |
 | ChromaDB empty on Actions | Ensure history file is committed (not ignored) — `_seed_from_history()` needs it |
-| Image text gibberish | Keep bubble/label fragments ≤8 words (enforced in templates) — Stability renders short text best |
+| Image text gibberish | Keep bubble/label fragments ≤8 words (enforced in templates) — Cloudflare FLUX renders short text best |
 
 ---
 
