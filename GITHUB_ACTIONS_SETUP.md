@@ -40,7 +40,8 @@ Add all three:
 |--------------------|------------------------------------------|
 | `GEMINI_API_KEY`   | your Gemini API key (from `.env`)        |
 | `LINKEDIN_TOKEN`   | your LinkedIn OAuth token (from `.env`)  |
-| `STABILITY_AI`     | your Stability AI key (from `.env`)      |
+| `CLOUDFLARE_ACCOUNT_ID` | your Cloudflare Account ID (from `.env`) |
+| `CLOUDFLARE_API_KEY` | your Cloudflare API token (from `.env`)  |
 
 These are encrypted and are only injected into the GitHub-hosted runner at
 runtime — they are never committed to the repo or visible in logs.
@@ -60,11 +61,11 @@ You get an email from GitHub if a run fails.
 
 ```
 [cloud runner starts]
-  → create .env from Secrets (GEMINI_API_KEY, LINKEDIN_TOKEN, STABILITY_AI)
+  → create .env from Secrets (GEMINI_API_KEY, LINKEDIN_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_KEY)
   → pip install -r requirements.txt
   → python linkedin_pipeline.py
        pick_topic → generate_content → critique/revise →
-       image_prompt → uniqueness check → Stability AI image → post to LinkedIn
+       image_prompt → uniqueness check → Cloudflare Workers AI image → post to LinkedIn
   → commit posts_history.json back (git-friendly; re-seeds ChromaDB next run)
 [published to LinkedIn automatically]
 ```

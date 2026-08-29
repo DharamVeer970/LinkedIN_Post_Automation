@@ -1,10 +1,11 @@
 """
 LinkedIn Daily Post Automation Pipeline (LangGraph)
 Flow: topic (latest fetch + fallback) -> content -> self-critique/revision loop ->
-      image prompt -> uniqueness check -> image gen (Stability AI ultra) -> post -> save history
+      image prompt -> uniqueness check -> image gen (Cloudflare Workers AI) -> post -> save history
 
 Text generation: Google Gemini (latest Flash model)
-Image generation: Stability AI ultra (api.stability.ai/v2beta/stable-image/generate/ultra)
+Image generation: Cloudflare Workers AI (@cf/black-forest-labs/flux-1-schnell),
+                  falls back to @cf/stabilityai/stable-diffusion-xl-base-1.0 on the same account
 Uniqueness tracking: local ChromaDB (similarity check against old posts)
 Topics: multi-domain (AI, business, career, psychology, science, design, money)
         - free RSS feeds per domain + evergreen lists, defined in post_prompts.py
@@ -16,7 +17,15 @@ import os
 import json
 import time
 import random
+import secrets
 import textwrap
+import warnings
+
+# Suppress the noisy LangGraph/LangChain pending-deprecation warning about
+# `allowed_objects` (harmless internal notice, not something we control) -
+# must be set before importing langgraph.graph, which triggers the warning.
+warnings.filterwarnings("ignore", message=".*allowed_objects.*")
+
 import requests
 import feedparser
 import chromadb
@@ -32,11 +41,11 @@ from post_prompts import (
     IMAGE_STYLES,
     INFOGRAPHIC_FORMATS,  # backward compat
     COLOR_THEMES,
-    NEGATIVE_PROMPT,
     content_prompt,
     critique_prompt,
     revise_prompt,
     image_prompt_gen,
+    image_qa_prompt,
 )
 
 # linkedin_poster.py must exist in the same folder; posting functions are imported from there
@@ -46,20 +55,23 @@ from linkedin_poster import get_person_urn, register_image_upload, upload_image_
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LINKEDIN_TOKEN = os.getenv("LINKEDIN_TOKEN")
-STABILITY_API_KEY = os.getenv("STABILITY_AI")
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_KEY = os.getenv("CLOUDFLARE_API_KEY")
 
-if not STABILITY_API_KEY:
-    print("[warn] STABILITY_API_KEY not found in .env - image generation will fail. Add STABILITY_API_KEY=sk-...")
-# Gemini 3.6 Flash: latest stable Flash model (gemini-2.0-flash is shut down per
-# Google's deprecation list; gemini-2.5-flash was rate-limited for new keys).
-GEMINI_MODEL = "gemini-3.6-flash"
+if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_KEY:
+    print("[warn] CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY not found in .env - image generation will fail.")
+
+
+# Gemini models in priority order: flash for quality, lite as quota fallback.
+
+GEMINI_MODELS = ("gemini-3.6-flash", "gemini-3.1-flash-lite")
 SIMILARITY_THRESHOLD = 0.85                    # anything above this similarity is treated as duplicate
 MAX_RETRIES = 3                                # how many times to retry with a new topic if duplicate found
 MAX_REVISIONS = 2                              # how many times the critic loop may revise a weak draft
 QUALITY_GATE = 7                               # post must score at least this to skip revision
 
 # ---- Gemini API call settings (free-tier rate-limit protection) ----
-API_MAX_RETRIES = 5                            # how many times to retry on 429/5xx/network errors
+MODEL_MAX_RETRIES = 2                          # retries per model before switching to the next model
 API_BACKOFF_BASE = 2                           # base seconds for exponential backoff (2, 4, 8, 16…)
 API_BACKOFF_MAX = 60                           # cap backoff wait at this many seconds
 API_PACE_DELAY = 5.0                           # min seconds between consecutive successful API calls
@@ -91,7 +103,7 @@ def _seed_from_history():
     existing = collection.count()
     new_docs = history[existing:]
     for i, doc in enumerate(new_docs):
-        collection.add(document=doc, id=f"post_{existing + i + 1}")
+        collection.add(documents=[doc], ids=[f"post_{existing + i + 1}"])
     print(f"[history] seeded {len(new_docs)} post(s) into ChromaDB ({collection.count()} total)")
     return len(new_docs)
 
@@ -134,61 +146,108 @@ def _gemini_backoff_wait(resp, attempt: int) -> float:
     return wait + random.uniform(0, 1)  # jitter
 
 
-def call_gemini(prompt: str) -> str:
-    """Call Gemini for text generation (free tier).
-
-    Includes exponential-backoff retries for HTTP 429 (rate-limit) and
-    5xx / network errors, and PRINTS the actual response body on a 429 so
-    you can see exactly which quota was hit (RPM vs RPD vs TPM) instead of
-    guessing. Honors the ``Retry-After`` header when present. A small
-    pacing delay between successful calls keeps us under the free-tier
-    requests-per-minute ceiling.
-
-    Note: if the body says a per-DAY quota was exceeded, retrying within
-    this run will NOT help - that quota only resets at midnight Pacific
-    Time. In that case switch GEMINI_MODEL to a lite variant or wait.
-    """
-    url = (
+def _gemini_url(model: str) -> str:
+    return (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        f"{model}:generateContent?key={GEMINI_API_KEY}"
     )
+
+
+def call_gemini(prompt: str) -> str:
+    """Call Gemini for text generation with multi-model quota fallback.
+
+    Tries each model in GEMINI_MODELS in order. Within a model, 429/5xx are
+    retried with backoff; if a model's quota is exhausted (429 persists or a
+    per-day quota error), it moves on to the next model instead of dying.
+    """
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-
     last_exc = None
-    for attempt in range(1, API_MAX_RETRIES + 1):
-        try:
-            resp = requests.post(url, json=body, timeout=60)
-            status = resp.status_code
+    for model in GEMINI_MODELS:
+        for attempt in range(1, MODEL_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(_gemini_url(model), json=body, timeout=60)
+                status = resp.status_code
 
-            # --- Rate-limited (429) or transient server errors (5xx) -> retry ---
-            if status == 429 or status >= 500:
-                print(f"[gemini] HTTP {status} body: {resp.text[:300]}")  # shows RPM vs RPD vs TPM
-                wait = _gemini_backoff_wait(resp, attempt)
-                print(f"[gemini] backing off {wait:.1f}s (attempt {attempt}/{API_MAX_RETRIES})")
+                # --- Rate-limited (429) or transient server errors (5xx) ---
+                if status == 429 or status >= 500:
+                    print(f"[gemini] {model} HTTP {status} body: {resp.text[:200]}")
+                    if attempt < MODEL_MAX_RETRIES:
+                        wait = _gemini_backoff_wait(resp, attempt)
+                        print(f"[gemini] backing off {wait:.1f}s (attempt {attempt}/{MODEL_MAX_RETRIES})")
+                        time.sleep(wait)
+                        continue
+                    print(f"[gemini] {model} quota exhausted - switching model")
+                    break  # move to next model
+
+                # --- Non-retryable client errors (400, 401, 403) -> fail fast ---
+                resp.raise_for_status()
+                result = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                time.sleep(API_PACE_DELAY)  # stay under free-tier RPM
+                return result
+
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as exc:
+                last_exc = exc
+                wait = _gemini_backoff_wait(None, attempt)
+                print(f"[gemini] {model} network error ({type(exc).__name__}), "
+                      f"backing off {wait:.1f}s (attempt {attempt}/{MODEL_MAX_RETRIES})")
                 time.sleep(wait)
-                continue
-
-            # --- Non-retryable client errors (400, 401, 403, etc.) -> fail fast ---
-            resp.raise_for_status()
-            result = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-            # Pace subsequent calls to stay within the free-tier RPM limit
-            time.sleep(API_PACE_DELAY)
-            return result
-
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout) as exc:
-            last_exc = exc
-            wait = _gemini_backoff_wait(None, attempt)
-            print(f"[gemini] network/timeout error ({type(exc).__name__}), "
-                  f"backing off {wait:.1f}s "
-                  f"(attempt {attempt}/{API_MAX_RETRIES})")
-            time.sleep(wait)
 
     raise RuntimeError(
-        f"Gemini API failed after {API_MAX_RETRIES} attempts - see the "
-        "printed response bodies above for the exact quota that was hit"
+        "Gemini API failed on all models (GEMINI_MODELS) - see printed "
+        "response bodies above for the exact quota that was hit"
     ) from last_exc
+
+
+def call_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str) -> str:
+    """Send an image + text prompt to Gemini and return the text reply.
+
+    Used for the image spelling/legibility QA check. Same multi-model
+    quota fallback as call_gemini(); QA is best-effort.
+    """
+    import base64
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0},
+    }
+    for model in GEMINI_MODELS:
+        for attempt in range(1, MODEL_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(_gemini_url(model), json=body, timeout=90)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    if attempt < MODEL_MAX_RETRIES:
+                        time.sleep(_gemini_backoff_wait(resp, attempt))
+                        continue
+                    break  # next model
+                resp.raise_for_status()
+                return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout):
+                time.sleep(_gemini_backoff_wait(None, attempt))
+    # QA is best-effort - on repeated failure accept the image rather than kill the run
+    return "VERDICT: OK"
+
+
+def check_image_spelling(image_bytes: bytes, mime_type: str) -> tuple[bool, str]:
+    """Returns (ok, issues). ok=True means all visible text is correct & readable."""
+    try:
+        reply = call_gemini_vision(image_bytes, mime_type, image_qa_prompt())
+    except Exception as e:
+        print(f"[image-qa] vision check failed ({e}) - accepting image")
+        return True, ""
+    upper = reply.upper()
+    ok = "VERDICT: OK" in upper or "VERDICT" not in upper
+    issues = ""
+    for line in reply.splitlines():
+        if line.strip().upper().startswith("ISSUES:"):
+            issues = line.split(":", 1)[1].strip()
+    return ok, issues
+
 
 
 def get_topic_pool() -> list[str]:
@@ -209,7 +268,7 @@ def pick_topic(state: PipelineState) -> PipelineState:
     pool = [t for t in get_topic_pool() if t not in tried]
     if not pool:
         pool = ALL_EVERGREEN_TOPICS  # once everything has been tried, pick from evergreen lists
-    topic = random.choice(pool)
+    topic = secrets.choice(pool)  # crypto-safe pick 
     print(f"[topic] picked ({len(pool)} available): {topic}")
     state["topic"] = topic
     state["tried_topics"] = tried + [topic]
@@ -320,41 +379,148 @@ def route_after_uniqueness(state: PipelineState) -> str:
     return "pick_topic"
 
 
-# ---- Node 6: Generate the image - Stability AI Ultra (exactly your snippet)----
-def generate_image(state: PipelineState) -> PipelineState:
-    if not STABILITY_API_KEY:
-        raise ValueError("STABILITY_API_KEY missing in .env - add STABILITY_API_KEY=sk-...")
+# ---- Image generation via Cloudflare Workers AI (REST endpoint) ----
+JPEG_MIME = "image/jpeg"  # default MIME for all Workers AI image responses (SonarQube S1192)
+CF_FLUX2_KLEIN = "@cf/black-forest-labs/flux-2-klein-4b"  # ultra-fast distilled FLUX.2 (default)
+CF_FLUX2_DEV = "@cf/black-forest-labs/flux-2-dev"        # higher quality, slower fallback
+CF_FLUX1_SCHNELL = "@cf/black-forest-labs/flux-1-schnell"  # fast fallback
+CF_SDXL_MODEL = "@cf/stabilityai/stable-diffusion-xl-base-1.0"  # last resort
 
-    full_prompt = state["image_prompt"].strip()
-    print(f"[image] Stability ultra | prompt: {full_prompt[:200]}...")
 
-    response = requests.post(
-        f"https://api.stability.ai/v2beta/stable-image/generate/ultra",
-        headers={
-            "authorization": f"Bearer {STABILITY_API_KEY}",
-            "accept": "image/*"
-        },
-        files={"none": ''},
-        data={
-            "prompt": full_prompt,
-            "output_format": "webp",
-        },
+def _run_cf_model(model: str, prompt: str) -> tuple[bytes, str]:
+    """Call one Cloudflare Workers AI image model; returns (image_bytes, content_type).
+
+    Raises RuntimeError with the API error message on any non-200 response.
+    """
+    import base64
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+        f"/ai/run/{model}"
+    )
+    if model in (CF_FLUX2_KLEIN, CF_FLUX2_DEV):
+        # FLUX.2 models require multipart/form-data and return JSON {result: {image: base64}}
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {CLOUDFLARE_API_KEY}"},
+            files={
+                "prompt": (None, prompt),
+                "steps": (None, "8"),
+                "width": (None, "1024"),
+                "height": (None, "1024"),
+                "guidance": (None, "3.5"),
+                "seed": (None, str(secrets.randbelow(2_147_483_647))),  # crypto-safe seed (SonarQube S2245)
+            },
+            timeout=180,
+        )
+    elif model == CF_FLUX1_SCHNELL:
+        # flux-1-schnell's JSON schema only accepts prompt + steps; returns raw image bytes
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"prompt": prompt, "steps": 8},
+            timeout=180,
+        )
+    else:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"prompt": prompt},
+            timeout=180,
+        )
+    if resp.status_code != 200:
+        try:
+            detail = resp.json().get("errors", resp.text[:300])
+        except Exception:
+            detail = resp.text[:300]
+        raise RuntimeError(f"Cloudflare {model} error {resp.status_code}: {detail}")
+    content_type = resp.headers.get("Content-Type", JPEG_MIME)
+    if "image" in content_type:
+        return resp.content, content_type
+    # JSON-wrapped result: {"result": {"image": "<base64>"}}
+    try:
+        payload = resp.json()
+        b64 = (payload.get("result") or {}).get("image")
+        if b64:
+            return base64.b64decode(b64), JPEG_MIME
+    except Exception:
+        pass
+    raise RuntimeError(f"Cloudflare {model} returned non-image response: {content_type}")
+
+
+# ---- Node 6: Generate the image - Cloudflare Workers AI (klein-4b, then dev/schnell/SDXL) ----
+IMAGE_QA_MAX_ATTEMPTS = 2   # generate -> Gemini vision spell-check -> 1 retry (saves Cloudflare neurons)
+
+
+def _generate_via_models(prompt: str, errors: list) -> tuple | None:
+    """Try each Cloudflare model in order; return (bytes, content_type) or None."""
+    for model in (CF_FLUX2_KLEIN, CF_FLUX2_DEV, CF_FLUX1_SCHNELL, CF_SDXL_MODEL):
+        try:
+            return _run_cf_model(model, prompt)
+        except Exception as e:
+            errors.append(str(e))
+            print(f"[image] {e} - trying next model...")
+    return None
+
+
+def _build_retry_prompt(full_prompt: str, issues: str) -> str:
+    """Stricter re-render prompt after a QA failure; behavior unchanged."""
+    return (
+        f"{full_prompt}\n\nIMPORTANT: previous render contained misspelled or "
+        f"garbled text ({issues}). Re-render with FEWER, SHORTER text fragments "
+        f"(max 4 labels, 1-3 words each), and spell every quoted word "
+        f"letter-for-letter correctly."
     )
 
-    if response.status_code == 200:
-        image_path = os.path.join(IMAGES_DIR, f"post_image_{int(time.time())}.webp")
-        with open(image_path, 'wb') as file:
-            file.write(response.content)
-        print(f"[image] saved {len(response.content)//1024}KB -> {image_path}")
-        state["image_path"] = image_path
-        return state
+
+def _render_best_image(full_prompt: str, errors: list) -> tuple | None:
+    """Generate + Gemini QA up to IMAGE_QA_MAX_ATTEMPTS; keep the best render."""
+    best = None
+    prompt = full_prompt
+    for attempt in range(1, IMAGE_QA_MAX_ATTEMPTS + 1):
+        generated = _generate_via_models(prompt, errors)
+        if generated is None:
+            return best
+        img, ctype = generated
+        ok, issues = check_image_spelling(img, JPEG_MIME)
+        print(f"[image-qa] attempt {attempt}: {'OK' if ok else 'BAD text'} "
+              f"{('- ' + issues) if issues else ''}")
+        if ok:
+            return img, ctype
+        best = best or (img, ctype)  # keep the failed attempt as a fallback
+        prompt = _build_retry_prompt(full_prompt, issues)
+    return best
+
+
+def generate_image(state: PipelineState) -> PipelineState:
+    full_prompt = state["image_prompt"].strip()
+    image_bytes = None
+    ext = "jpg"
+    errors = []
+
+    if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_KEY:
+        print(f"[image] Cloudflare Workers AI ({CF_FLUX2_KLEIN}) | prompt: {full_prompt[:200]}...")
+        best = _render_best_image(full_prompt, errors)
+        if best:
+            image_bytes, content_type = best
+            ext = "png" if "png" in content_type else "jpg"
     else:
-        try:
-            err = response.json()
-        except Exception:
-            err = response.text[:500]
-        print(f"[image] Stability error {response.status_code}: {err}")
-        raise Exception(str(err))
+        errors.append("CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY missing from .env")
+
+    if image_bytes is None:
+        raise RuntimeError(f"Image generation failed on all Cloudflare models: {'; '.join(errors)}")
+
+    image_path = os.path.join(IMAGES_DIR, f"post_image_{int(time.time())}.{ext}")
+    with open(image_path, 'wb') as file:
+        file.write(image_bytes)
+    print(f"[image] saved {len(image_bytes)//1024}KB -> {image_path}")
+    state["image_path"] = image_path
+    return state
 
 
 # ---- Node 7: Publish the actual post to LinkedIn ----

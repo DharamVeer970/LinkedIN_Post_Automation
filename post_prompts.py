@@ -13,8 +13,8 @@ the generated artwork looks like - no need to touch the pipeline code.
 TOPIC_DOMAINS = {
     "AI & Technology": {
         "feeds": [
-            "http://export.arxiv.org/rss/cs.AI",
-            "http://export.arxiv.org/rss/cs.CL",
+            "https://export.arxiv.org/rss/cs.AI",
+            "https://export.arxiv.org/rss/cs.CL",
             "https://www.artificialintelligence-news.com/feed/",
         ],
         "evergreen": [
@@ -66,9 +66,9 @@ TOPIC_DOMAINS = {
 
     "Latest DevNews & Models": {
         "feeds": [
-            "http://export.arxiv.org/rss/cs.AI",
-            "http://export.arxiv.org/rss/cs.CL",
-            "http://export.arxiv.org/rss/cs.SE",
+            "https://export.arxiv.org/rss/cs.AI",
+            "https://export.arxiv.org/rss/cs.CL",
+            "https://export.arxiv.org/rss/cs.SE",
             "https://hnrss.org/frontpage",
             "https://techcrunch.com/feed/",
         ],
@@ -326,9 +326,31 @@ def image_prompt_gen(post_text: str) -> str:
         "RULES:\n"
         "- Choose the ONE template that best fits the post's structure.\n"
         "- Output ONLY the final prompt, no explanation.\n"
-        "- Keep each text fragment under 8 words for legibility.\n"
-        "- Always end with: 'crisp vector, 8k, ultra-detailed, perfectly legible English'\n\n"
+        "- Keep each text fragment under 5 words for legibility.\n"
+        "- Use AT MOST 8 separate text fragments in the whole image. Fewer is better - "
+        "text models misspell long text. Prefer icons + 1-3 word labels over sentences.\n"
+        "- Write every text fragment inside double quotes, e.g. label \"AI Agents\", and "
+        "prefix the quote with: exact text. The image model must render each quoted "
+        "string letter-for-letter with CORRECT spelling, no invented words, no gibberish.\n"
+        "- Avoid rare/technical spellings, acronyms longer than 5 letters, and punctuation "
+        "inside quoted labels (apostrophes, ampersands) - they cause typos.\n"
+        "- Always end with: 'crisp vector, 8k, ultra-detailed, perfectly legible English, "
+        "all text spelled exactly as quoted'\n\n"
         f"Post:\n{post_text[:500]}"
+    )
+
+
+def image_qa_prompt() -> str:
+    return (
+        "Look at this image. List ALL visible text exactly as written, then check:\n"
+        "1. Is every word a correctly-spelled English word?\n"
+        "2. Is every text fragment readable (not garbled/distorted letters)?\n"
+        "3. Do the texts make sense together (no random gibberish strings)?\n"
+        "Answer in EXACTLY this format, nothing else:\n"
+        "VERDICT: OK   (if every visible word is correct, readable English)\n"
+        "VERDICT: BAD  (if ANY word is misspelled, garbled or gibberish)\n"
+        "ISSUES: <comma-separated list of each wrong/garbled text you see; "
+        "write 'none' if verdict is OK>"
     )
 
 

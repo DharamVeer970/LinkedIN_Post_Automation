@@ -65,7 +65,8 @@ jobs:
         run: |
           echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
           echo "LINKEDIN_TOKEN=${{ secrets.LINKEDIN_TOKEN }}" >> .env
-          echo "STABILITY_AI=${{ secrets.STABILITY_AI }}" >> .env
+          echo "CLOUDFLARE_ACCOUNT_ID=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" >> .env
+          echo "CLOUDFLARE_API_KEY=${{ secrets.CLOUDFLARE_API_KEY }}" >> .env
           echo "  (secrets applied — .env is git-ignored, will not be pushed)"
 
       - name: Run the LinkedIn posting pipeline
