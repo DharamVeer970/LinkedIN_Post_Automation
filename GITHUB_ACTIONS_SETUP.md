@@ -1,11 +1,11 @@
 # LinkedIn Auto-Post via GitHub Actions (Cloud Scheduling)
 
-Runs every 2 days on GitHub's servers, so it works **even when your laptop is
+Runs every 4 days on GitHub's servers, so it works **even when your laptop is
 shut down**. No server rental, no VPN — just free GitHub Actions minutes.
 
 > **Caveat:** GitHub Actions **free / free-for-public** repos get up to
 > 2,000 minutes/month. A single scheduled run takes ~1–3 min, so running
-> twice a month uses a few minutes — well within free limits.
+> a few times a month uses very few minutes — well within free limits.
 
 ---
 
@@ -34,7 +34,7 @@ git push -u origin main
 
 Go to: **Repo → Settings → Secrets and variables → Actions → New repository secret**
 
-Add all three:
+Add all four:
 
 | Secret name        | Value                                    |
 |--------------------|------------------------------------------|
@@ -48,8 +48,7 @@ runtime — they are never committed to the repo or visible in logs.
 
 ## 4. Let it run
 
-- The workflow `.github/workflows/auto_post.yml` triggers on the cron
-  `"0 9 */2 * *"` → **every 2 days at 09:00 UTC** (2:30 PM IST / 4 AM ET / 1 AM PT).
+- The workflow `.github/workflows/auto_post.yml` runs on a daily cron at 09:00 UTC with a `day_of_year % 4 == 0` check → **every 4 days at 09:00 UTC** (2:30 PM IST / 4 AM ET / 1 AM PT).
 - Watch status: **Repo → Actions → *LinkedIn Auto-Post***.
 - Run it manually anytime with the **"Run workflow"** button.
 
@@ -83,8 +82,8 @@ Every time you change a key in your local `.env`, update the matching
 
 | Symptom | Fix |
 |---------|-----|
-| Run fails on "model not found" | Update `GEMINI_MODEL` in `linkedin_pipeline.py` |
+| Run fails on "model not found" | Update `GEMINI_MODELS` in `linkedin_pipeline.py` |
 | `429 Too Many Requests` | Free quota hit — the pipeline retries automatically; check https://ai.dev/rate-limit |
 | "Not authorized / Invalid token" | Refresh the LinkedIn OAuth token via `linkedin_poster.py`, then update the `LINKEDIN_TOKEN` secret |
 | No post appears on LinkedIn | Check the repo **Actions** tab logs; re-run manually to retry |
-| Two posts on the same day | The cron is 2-day cadence; check you only have one `schedule` entry |
+| Two posts on the same day | Check you only have one scheduled workflow enabled |
