@@ -469,9 +469,18 @@ def _run_cf_model(model: str, prompt: str) -> tuple[bytes, str]:
 IMAGE_QA_MAX_ATTEMPTS = 3   # normal -> fewer labels -> text-free (spelling-proof, neuron-friendly)
 
 
-def _generate_via_models(prompt: str, errors: list) -> tuple | None:
-    """Try each Cloudflare model in order; return (bytes, content_type) or None."""
-    for model in (CF_FLUX2_KLEIN, CF_FLUX2_DEV, CF_FLUX1_SCHNELL, CF_SDXL_MODEL):
+def _generate_via_models(prompt: str, errors: list, attempt: int = 1) -> tuple | None:
+    """Try Cloudflare models in order; return (bytes, content_type) or None.
+
+    Attempt 1 uses the cheap-first chain (klein-4b). On QA-failed retries we
+    lead with the BEST text-rendering model (flux-2-dev) so the re-render has
+    the strongest chance of spelling the text correctly.
+    """
+    if attempt >= 2:
+        models = (CF_FLUX2_DEV, CF_FLUX2_KLEIN, CF_FLUX1_SCHNELL, CF_SDXL_MODEL)
+    else:
+        models = (CF_FLUX2_KLEIN, CF_FLUX2_DEV, CF_FLUX1_SCHNELL, CF_SDXL_MODEL)
+    for model in models:
         try:
             return _run_cf_model(model, prompt)
         except Exception as e:
@@ -520,13 +529,14 @@ def _render_best_image(full_prompt: str, errors: list) -> tuple | None:
     best = None
     prompt = full_prompt
     for attempt in range(1, IMAGE_QA_MAX_ATTEMPTS + 1):
-        generated = _generate_via_models(prompt, errors)
+        generated = _generate_via_models(prompt, errors, attempt)
         if generated is None:
             return best
         img, ctype = generated
         qa_img, qa_ctype = _normalize_to_png(img, ctype)
         ok, issues = check_image_spelling(qa_img, qa_ctype)
-        print(f"[image-qa] attempt {attempt}: {'OK' if ok else 'BAD text'} "
+        model_used = "flux-2-dev (best)" if attempt >= 2 else "flux-2-klein-4b (fast)"
+        print(f"[image-qa] attempt {attempt} [{model_used}]: {'OK' if ok else 'BAD text'} "
               f"{('- ' + issues) if issues else ''}")
         if ok:
             return qa_img, qa_ctype
