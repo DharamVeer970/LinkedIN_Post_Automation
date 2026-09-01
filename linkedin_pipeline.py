@@ -21,9 +21,7 @@ import random
 import secrets
 import warnings
 
-# Suppress the noisy LangGraph/LangChain pending-deprecation warning about
-# `allowed_objects` (harmless internal notice, not something we control) -
-# must be set before importing langgraph.graph, which triggers the warning.
+# Suppress the noisy LangGraph/LangChain pending-deprecation warning 
 warnings.filterwarnings("ignore", message=".*allowed_objects.*")
 
 import requests
@@ -200,7 +198,8 @@ def call_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str) -> str:
     """Send an image + text prompt to Gemini and return the text reply.
 
     Used for the image spelling/legibility QA check. Same multi-model
-    quota fallback as call_gemini(); QA is best-effort.
+    quota fallback as call_gemini(); on total failure reports an unparseable
+    BAD verdict so check_image_spelling stays fail-closed.
     """
     import base64
     body = {
@@ -226,8 +225,8 @@ def call_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str) -> str:
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout):
                 time.sleep(_gemini_backoff_wait(None, attempt))
-    # QA is best-effort - on repeated failure accept the image rather than kill the run
-    return "VERDICT: OK"
+    # Fail-closed: if the vision API is unreachable we cannot verify the text.
+    return "VERDICT: BAD - vision QA unavailable (Gemini API failed on all models)"
 
 
 def check_image_spelling(image_bytes: bytes, mime_type: str) -> tuple[bool, str]:
@@ -235,8 +234,9 @@ def check_image_spelling(image_bytes: bytes, mime_type: str) -> tuple[bool, str]
     try:
         reply = call_gemini_vision(image_bytes, mime_type, image_qa_prompt())
     except Exception as e:
-        print(f"[image-qa] vision check failed ({e}) - accepting image")
-        return True, ""
+        # Fail-closed: an unverifiable image must not be accepted as clean.
+        print(f"[image-qa] vision check failed ({e}) - treating as BAD")
+        return False, f"vision QA unavailable: {e}"
     upper = reply.upper()
     # Fail-closed: accept ONLY an explicit VERDICT: OK. A missing, garbled or
     # unexpected verdict is treated as BAD so the image gets re-rendered.
