@@ -234,7 +234,7 @@ def call_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str) -> str:
 
 
 def check_image_spelling(image_bytes: bytes, mime_type: str) -> tuple[bool, str]:
-    """Returns (ok, issues). ok=True means all visible text is correct & readable."""
+    """Returns (ok, issues). ok=True means visible text is spelled, readable, and grammatical."""
     try:
         reply = call_gemini_vision(image_bytes, mime_type, image_qa_prompt())
     except Exception as e:
@@ -454,7 +454,7 @@ def _run_cf_model(model: str, prompt: str) -> tuple[bytes, str]:
 
 
 # ---- Node 6: Generate the image - Cloudflare Workers AI (klein-4b, then dev/schnell/SDXL) ----
-IMAGE_QA_MAX_ATTEMPTS = 2   # generate -> Gemini vision spell-check -> 1 retry (saves Cloudflare neurons)
+IMAGE_QA_MAX_ATTEMPTS = 3   # generate -> Gemini vision text QA -> up to 2 retries
 
 
 def _generate_via_models(prompt: str, errors: list) -> tuple | None:
@@ -471,10 +471,10 @@ def _generate_via_models(prompt: str, errors: list) -> tuple | None:
 def _build_retry_prompt(full_prompt: str, issues: str) -> str:
     """Stricter re-render prompt after a QA failure; behavior unchanged."""
     return (
-        f"{full_prompt}\n\nIMPORTANT: previous render contained misspelled or "
-        f"garbled text ({issues}). Re-render with FEWER, SHORTER text fragments "
+        f"{full_prompt}\n\nIMPORTANT: previous render contained spelling, grammar, or "
+        f"legibility issues ({issues}). Re-render with FEWER, SHORTER text fragments "
         f"(max 4 labels, 1-3 words each), and spell every quoted word "
-        f"letter-for-letter correctly."
+        f"letter-for-letter correctly using grammatically valid English."
     )
 
 
@@ -487,12 +487,12 @@ def _render_best_image(full_prompt: str, errors: list) -> tuple | None:
         if generated is None:
             return best
         img, ctype = generated
-        ok, issues = check_image_spelling(img, JPEG_MIME)
+        ok, issues = check_image_spelling(img, ctype)
         print(f"[image-qa] attempt {attempt}: {'OK' if ok else 'BAD text'} "
               f"{('- ' + issues) if issues else ''}")
         if ok:
             return img, ctype
-        best = best or (img, ctype)  # keep the failed attempt as a fallback
+        best = (img, ctype)  # keep the latest failed attempt as fallback
         prompt = _build_retry_prompt(full_prompt, issues)
     return best
 

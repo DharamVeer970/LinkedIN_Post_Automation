@@ -332,10 +332,12 @@ def image_prompt_gen(post_text: str) -> str:
         "- Write every text fragment inside double quotes, e.g. label \"AI Agents\", and "
         "prefix the quote with: exact text. The image model must render each quoted "
         "string letter-for-letter with CORRECT spelling, no invented words, no gibberish.\n"
+        "- Keep labels grammatically correct and natural in plain English "
+        "(e.g., short noun phrases or simple verb phrases).\n"
         "- Avoid rare/technical spellings, acronyms longer than 5 letters, and punctuation "
         "inside quoted labels (apostrophes, ampersands) - they cause typos.\n"
         "- Always end with: 'crisp vector, 8k, ultra-detailed, perfectly legible English, "
-        "all text spelled exactly as quoted'\n\n"
+        "all text spelled exactly as quoted, grammatically correct'\n\n"
         f"Post:\n{post_text[:500]}"
     )
 
@@ -345,10 +347,11 @@ def image_qa_prompt() -> str:
         "Look at this image. List ALL visible text exactly as written, then check:\n"
         "1. Is every word a correctly-spelled English word?\n"
         "2. Is every text fragment readable (not garbled/distorted letters)?\n"
-        "3. Do the texts make sense together (no random gibberish strings)?\n"
+        "3. Is each text fragment grammatically correct or naturally phrased English?\n"
+        "4. Do the texts make sense together (no random gibberish strings)?\n"
         "Answer in EXACTLY this format, nothing else:\n"
-        "VERDICT: OK   (if every visible word is correct, readable English)\n"
-        "VERDICT: BAD  (if ANY word is misspelled, garbled or gibberish)\n"
+        "VERDICT: OK   (if every visible word is spelled correctly, readable, and grammatically natural)\n"
+        "VERDICT: BAD  (if ANY word is misspelled, garbled, grammatically wrong, or gibberish)\n"
         "ISSUES: <comma-separated list of each wrong/garbled text you see; "
         "write 'none' if verdict is OK>"
     )
