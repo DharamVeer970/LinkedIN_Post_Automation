@@ -466,7 +466,7 @@ def _run_cf_model(model: str, prompt: str) -> tuple[bytes, str]:
 
 
 # ---- Node 6: Generate the image - Cloudflare Workers AI (klein-4b, then dev/schnell/SDXL) ----
-IMAGE_QA_MAX_ATTEMPTS = 4   # normal -> fewer labels -> 2 labels -> text-free (spelling-proof)
+IMAGE_QA_MAX_ATTEMPTS = 3   # normal -> fewer labels -> text-free (spelling-proof, neuron-friendly)
 
 
 def _generate_via_models(prompt: str, errors: list) -> tuple | None:
@@ -481,9 +481,9 @@ def _generate_via_models(prompt: str, errors: list) -> tuple | None:
 
 
 def _build_retry_prompt(full_prompt: str, issues: str, attempt: int) -> str:
-    """Escalating re-render prompt after a QA failure - attempt 4 is text-free,
-    which makes spelling mistakes physically impossible."""
-    if attempt >= 4:
+    """Escalating re-render prompt after a QA failure - attempt 3 is text-free,
+    which makes spelling mistakes physically possible to avoid while saving neurons."""
+    if attempt >= 3:
         # Last resort: strip ALL text - typography is where image models fail most
         return (
             f"{full_prompt}\n\nCRITICAL: previous renders kept misspelling or garbling "
@@ -492,7 +492,7 @@ def _build_retry_prompt(full_prompt: str, issues: str, attempt: int) -> str:
             f"icons, symbols, shapes, arrows, charts and illustrations to convey the idea. "
             f"An image with zero characters cannot have typos - enforce zero characters."
         )
-    max_labels = {2: 4, 3: 2}.get(attempt, 3)
+    max_labels = 3 if attempt == 2 else 4
     return (
         f"{full_prompt}\n\nIMPORTANT: previous render contained misspelled, garbled, "
         f"duplicated or invented text ({issues}). Re-render with AT MOST {max_labels} "
