@@ -15,6 +15,7 @@ Credentials: loaded from a .env file (python-dotenv)
 
 import os
 import json
+import io
 import time
 import random
 import secrets
@@ -32,6 +33,7 @@ import chromadb
 from typing import TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
+from PIL import Image
 
 # All text prompts, topic domains and infographic style presets live in post_prompts.py
 from post_prompts import (
@@ -478,6 +480,19 @@ def _build_retry_prompt(full_prompt: str, issues: str) -> str:
     )
 
 
+def _normalize_to_png(image_bytes: bytes, content_type: str) -> tuple[bytes, str]:
+    """Return PNG bytes for cleaner text QA and final upload quality."""
+    if "png" in (content_type or "").lower():
+        return image_bytes, "image/png"
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            out = io.BytesIO()
+            img.save(out, format="PNG")
+            return out.getvalue(), "image/png"
+    except Exception:
+        return image_bytes, content_type
+
+
 def _render_best_image(full_prompt: str, errors: list) -> tuple | None:
     """Generate + Gemini QA up to IMAGE_QA_MAX_ATTEMPTS; keep the best render."""
     best = None
@@ -487,12 +502,13 @@ def _render_best_image(full_prompt: str, errors: list) -> tuple | None:
         if generated is None:
             return best
         img, ctype = generated
-        ok, issues = check_image_spelling(img, ctype)
+        qa_img, qa_ctype = _normalize_to_png(img, ctype)
+        ok, issues = check_image_spelling(qa_img, qa_ctype)
         print(f"[image-qa] attempt {attempt}: {'OK' if ok else 'BAD text'} "
               f"{('- ' + issues) if issues else ''}")
         if ok:
-            return img, ctype
-        best = (img, ctype)  # keep the latest failed attempt as fallback
+            return qa_img, qa_ctype
+        best = (qa_img, qa_ctype)  # keep the latest failed attempt as fallback
         prompt = _build_retry_prompt(full_prompt, issues)
     return best
 
@@ -508,6 +524,7 @@ def generate_image(state: PipelineState) -> PipelineState:
         best = _render_best_image(full_prompt, errors)
         if best:
             image_bytes, content_type = best
+            image_bytes, content_type = _normalize_to_png(image_bytes, content_type)
             ext = "png" if "png" in content_type else "jpg"
     else:
         errors.append("CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY missing from .env")
