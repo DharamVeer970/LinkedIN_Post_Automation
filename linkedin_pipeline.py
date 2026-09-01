@@ -243,11 +243,21 @@ def check_image_spelling(image_bytes: bytes, mime_type: str) -> tuple[bool, str]
         print(f"[image-qa] vision check failed ({e}) - accepting image")
         return True, ""
     upper = reply.upper()
-    ok = "VERDICT: OK" in upper or "VERDICT" not in upper
+    # Fail-closed: accept ONLY an explicit VERDICT: OK. A missing, garbled or
+    # unexpected verdict is treated as BAD so the image gets re-rendered.
+    ok = "VERDICT: OK" in upper and "VERDICT: BAD" not in upper
     issues = ""
     for line in reply.splitlines():
-        if line.strip().upper().startswith("ISSUES:"):
+        stripped = line.strip().upper()
+        if stripped.startswith("ISSUES:"):
             issues = line.split(":", 1)[1].strip()
+            if issues.lower() == "none":
+                issues = ""
+        elif stripped.startswith("TEXTS:") and not issues:
+            # fall back to the transcription when ISSUES: is missing/empty
+            transcription = line.split(":", 1)[1].strip()
+            if transcription and transcription.lower() != "none":
+                issues = f"check these fragments: {transcription}"
     return ok, issues
 
 
@@ -470,13 +480,23 @@ def _generate_via_models(prompt: str, errors: list) -> tuple | None:
     return None
 
 
-def _build_retry_prompt(full_prompt: str, issues: str) -> str:
-    """Stricter re-render prompt after a QA failure; behavior unchanged."""
+def _build_retry_prompt(full_prompt: str, issues: str, attempt: int) -> str:
+    """Stricter re-render prompt after a QA failure; gets tighter on each retry."""
+    if attempt >= 3:
+        # Last resort: strip almost all text - typography is where models fail most
+        return (
+            f"{full_prompt}\n\nIMPORTANT: previous renders kept misspelling or "
+            f"garbling text ({issues}). Render the SAME visual concept with "
+            f"ABSOLUTELY NO text, letters, words or captions anywhere in the image - "
+            f"use only icons, shapes, arrows and illustrations instead."
+        )
+    max_labels = 4 if attempt == 2 else 3
     return (
-        f"{full_prompt}\n\nIMPORTANT: previous render contained spelling, grammar, or "
-        f"legibility issues ({issues}). Re-render with FEWER, SHORTER text fragments "
-        f"(max 4 labels, 1-3 words each), and spell every quoted word "
-        f"letter-for-letter correctly using grammatically valid English."
+        f"{full_prompt}\n\nIMPORTANT: previous render contained misspelled, garbled, "
+        f"duplicated or invented text ({issues}). Re-render with AT MOST {max_labels} "
+        f"DIFFERENT text fragments (1-3 words each, no duplicates), spell every quoted "
+        f"word letter-for-letter correctly using common, simple English words only. "
+        f"Prefer icons and illustrations over text."
     )
 
 
@@ -509,7 +529,7 @@ def _render_best_image(full_prompt: str, errors: list) -> tuple | None:
         if ok:
             return qa_img, qa_ctype
         best = (qa_img, qa_ctype)  # keep the latest failed attempt as fallback
-        prompt = _build_retry_prompt(full_prompt, issues)
+        prompt = _build_retry_prompt(full_prompt, issues, attempt + 1)
     return best
 
 
