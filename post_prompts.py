@@ -174,7 +174,6 @@ TOPIC_DOMAINS = {
     },
 }
 
-ALL_DOMAIN_NAMES = list(TOPIC_DOMAINS.keys())
 ALL_RSS_FEEDS = [f for d in TOPIC_DOMAINS.values() for f in d["feeds"]]
 ALL_EVERGREEN_TOPICS = [t for d in TOPIC_DOMAINS.values() for t in d["evergreen"]]
 
@@ -234,15 +233,6 @@ VIRAL_TEMPLATES = {
         "with clearly moving cutting-edge lines connecting each process to the next, "
     ),
 }
-
-# For pipeline compatibility and manual override - not used when agent-driven
-IMAGE_STYLES = list(VIRAL_TEMPLATES.values())
-INFOGRAPHIC_FORMATS = IMAGE_STYLES
-COLOR_THEMES = ["default palette - style already includes colors"]
-NEGATIVE_PROMPT = (
-    "blurry, low resolution, pixelated, distorted, watermark, logo, "
-    "gibberish text, misspelled, lorem ipsum, extra fingers, photorealistic face"
-)
 
 
 # ====================================================================
@@ -371,18 +361,4 @@ def image_qa_prompt() -> str:
         "VERDICT: BAD  (if ANY fragment fails ANY check, or if you are unsure)\n"
         "ISSUES: <comma-separated list: the wrong text you saw and what it should be; "
         "write 'none' if verdict is OK>"
-    )
-
-
-def highlights_prompt(post_text: str) -> str:
-    return (
-        "From this LinkedIn post, extract a short title (3-6 words, no hashtags, no emoji) "
-        "and exactly 3 crisp highlight phrases (each under 5 words) that summarize the "
-        "flow/key idea. These will be rendered as text inside an infographic image. "
-        "Return in this EXACT format, nothing else:\n"
-        "TITLE: <title>\n"
-        "1. <highlight 1>\n"
-        "2. <highlight 2>\n"
-        "3. <highlight 3>\n\n"
-        f"Post:\n{post_text}"
     )

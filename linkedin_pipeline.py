@@ -19,7 +19,6 @@ import io
 import time
 import random
 import secrets
-import textwrap
 import warnings
 
 # Suppress the noisy LangGraph/LangChain pending-deprecation warning about
@@ -37,12 +36,8 @@ from PIL import Image
 
 # All text prompts, topic domains and infographic style presets live in post_prompts.py
 from post_prompts import (
-    TOPIC_DOMAINS,
     ALL_RSS_FEEDS,
     ALL_EVERGREEN_TOPICS,
-    IMAGE_STYLES,
-    INFOGRAPHIC_FORMATS,  # backward compat
-    COLOR_THEMES,
     content_prompt,
     critique_prompt,
     revise_prompt,
