@@ -466,7 +466,7 @@ def _run_cf_model(model: str, prompt: str) -> tuple[bytes, str]:
 
 
 # ---- Node 6: Generate the image - Cloudflare Workers AI (klein-4b, then dev/schnell/SDXL) ----
-IMAGE_QA_MAX_ATTEMPTS = 3   # generate -> Gemini vision text QA -> up to 2 retries
+IMAGE_QA_MAX_ATTEMPTS = 4   # normal -> fewer labels -> 2 labels -> text-free (spelling-proof)
 
 
 def _generate_via_models(prompt: str, errors: list) -> tuple | None:
@@ -481,16 +481,18 @@ def _generate_via_models(prompt: str, errors: list) -> tuple | None:
 
 
 def _build_retry_prompt(full_prompt: str, issues: str, attempt: int) -> str:
-    """Stricter re-render prompt after a QA failure; gets tighter on each retry."""
-    if attempt >= 3:
-        # Last resort: strip almost all text - typography is where models fail most
+    """Escalating re-render prompt after a QA failure - attempt 4 is text-free,
+    which makes spelling mistakes physically impossible."""
+    if attempt >= 4:
+        # Last resort: strip ALL text - typography is where image models fail most
         return (
-            f"{full_prompt}\n\nIMPORTANT: previous renders kept misspelling or "
-            f"garbling text ({issues}). Render the SAME visual concept with "
-            f"ABSOLUTELY NO text, letters, words or captions anywhere in the image - "
-            f"use only icons, shapes, arrows and illustrations instead."
+            f"{full_prompt}\n\nCRITICAL: previous renders kept misspelling or garbling "
+            f"text ({issues}). Render the SAME visual concept with ABSOLUTELY NO text, "
+            f"letters, numbers, words, signs or captions anywhere in the image. Use only "
+            f"icons, symbols, shapes, arrows, charts and illustrations to convey the idea. "
+            f"An image with zero characters cannot have typos - enforce zero characters."
         )
-    max_labels = 4 if attempt == 2 else 3
+    max_labels = {2: 4, 3: 2}.get(attempt, 3)
     return (
         f"{full_prompt}\n\nIMPORTANT: previous render contained misspelled, garbled, "
         f"duplicated or invented text ({issues}). Re-render with AT MOST {max_labels} "
