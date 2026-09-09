@@ -16,13 +16,26 @@ Credentials: loaded from a .env file (python-dotenv)
 import os
 import json
 import io
+import re
 import time
 import random
 import secrets
+import unicodedata
 import warnings
 
-# Suppress the noisy LangGraph/LangChain pending-deprecation warning 
-warnings.filterwarnings("ignore", message=".*allowed_objects.*")
+# Suppress LangGraph/LangChain deprecation warnings
+warnings.simplefilter("ignore")
+
+# Import and suppress the specific LangChain warning class
+try:
+    from langchain._api import LangChainPendingDeprecationWarning
+    warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+except ImportError:
+    try:
+        from langchain_core._api import LangChainPendingDeprecationWarning
+        warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+    except ImportError:
+        pass
 
 import requests
 import feedparser
@@ -30,7 +43,10 @@ import chromadb
 from typing import TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+
+# Re-enable warnings after imports
+warnings.simplefilter("default")
 
 # All text prompts, topic domains and infographic style presets live in post_prompts.py
 from post_prompts import (
@@ -70,6 +86,14 @@ MODEL_MAX_RETRIES = 2                          # retries per model before switch
 API_BACKOFF_BASE = 2                           # base seconds for exponential backoff (2, 4, 8, 16…)
 API_BACKOFF_MAX = 60                           # cap backoff wait at this many seconds
 API_PACE_DELAY = 5.0                           # min seconds between consecutive successful API calls
+
+# ---- Shared constants (Sonar S1192) ----
+IMAGE_PNG_MIME = "image/png"
+
+# Pre-compiled, linear regexes for image-prompt text extraction (Sonar S8786)
+# Linear - no nested/optional quantifiers; matches `exact text: "X"` from post_prompts.py
+_EXACT_TEXT_RE = re.compile(r'exact text: "([^"]+)"')
+_CLEAN_TEXT_RE = re.compile(r' exact text: "[^"]*"')
 
 if not GEMINI_API_KEY or not LINKEDIN_TOKEN:
     raise ValueError("Set GEMINI_API_KEY and LINKEDIN_TOKEN in your .env file (see .env.example)")
@@ -123,149 +147,103 @@ class PipelineState(TypedDict):
     revision_count: int
 
 
-def _gemini_backoff_wait(resp, attempt: int) -> float:
-    """Calculate how long to wait before retrying a failed Gemini API call.
-
-    Honors the ``Retry-After`` header when present; otherwise falls back
-    to exponential backoff with jitter (``base * 2^(attempt-1)`` +/- 1s),
-    capped at ``API_BACKOFF_MAX``.
-    """
-    if resp is not None:
-        retry_after = resp.headers.get("Retry-After")
-        if retry_after:
-            try:
-                return float(retry_after)
-            except ValueError:
-                pass  # malformed header -> fall back to exponential backoff
-    wait = min(API_BACKOFF_MAX, API_BACKOFF_BASE * (2 ** (attempt - 1)))
-    return wait + random.uniform(0, 1)  # jitter
-
-
-def _gemini_url(model: str) -> str:
-    return (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={GEMINI_API_KEY}"
-    )
-
-
-def call_gemini(prompt: str) -> str:
-    """Call Gemini for text generation with multi-model quota fallback.
-
-    Tries each model in GEMINI_MODELS in order. Within a model, 429/5xx are
-    retried with backoff; if a model's quota is exhausted (429 persists or a
-    per-day quota error), it moves on to the next model instead of dying.
-    """
-    body = {"contents": [{"parts": [{"text": prompt}]}]}
-    last_exc = None
-    for model in GEMINI_MODELS:
-        for attempt in range(1, MODEL_MAX_RETRIES + 1):
-            try:
-                resp = requests.post(_gemini_url(model), json=body, timeout=60)
-                status = resp.status_code
-
-                # --- Rate-limited (429) or transient server errors (5xx) ---
-                if status == 429 or status >= 500:
-                    print(f"[gemini] {model} HTTP {status} body: {resp.text[:200]}")
-                    if attempt < MODEL_MAX_RETRIES:
-                        wait = _gemini_backoff_wait(resp, attempt)
-                        print(f"[gemini] backing off {wait:.1f}s (attempt {attempt}/{MODEL_MAX_RETRIES})")
-                        time.sleep(wait)
-                        continue
-                    print(f"[gemini] {model} quota exhausted - switching model")
-                    break  # move to next model
-
-                # --- Non-retryable client errors (400, 401, 403) -> fail fast ---
-                resp.raise_for_status()
-                result = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                time.sleep(API_PACE_DELAY)  # stay under free-tier RPM
-                return result
-
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout) as exc:
-                last_exc = exc
-                wait = _gemini_backoff_wait(None, attempt)
-                print(f"[gemini] {model} network error ({type(exc).__name__}), "
-                      f"backing off {wait:.1f}s (attempt {attempt}/{MODEL_MAX_RETRIES})")
-                time.sleep(wait)
-
-    raise RuntimeError(
-        "Gemini API failed on all models (GEMINI_MODELS) - see printed "
-        "response bodies above for the exact quota that was hit"
-    ) from last_exc
-
-
-def call_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str) -> str:
-    """Send an image + text prompt to Gemini and return the text reply.
-
-    Used for the image spelling/legibility QA check. Same multi-model
-    quota fallback as call_gemini(); on total failure reports an unparseable
-    BAD verdict so check_image_spelling stays fail-closed.
-    """
+def _build_gemini_body(prompt: str, image_bytes: bytes | None) -> dict:
+    """Build Gemini request body."""
     import base64
-    body = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
-            ]
-        }],
-        "generationConfig": {"temperature": 0.0},
-    }
+    body: dict = {"contents": [{"parts": [{"text": prompt}]}]}
+    if image_bytes is None:
+        return body
+    body["contents"][0]["parts"].append(
+        {"inline_data": {"mime_type": IMAGE_PNG_MIME, "data": base64.b64encode(image_bytes).decode()}}
+    )
+    body["generationConfig"] = {"temperature": 0.0}
+    return body
+
+
+def _is_retryable_status(status: int) -> bool:
+    return status == 429 or status >= 500
+
+
+def _backoff_delay(attempt: int) -> float:
+    return min(API_BACKOFF_MAX, API_BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 1)
+
+
+def _call_single_model(model: str, body: dict, image_bytes: bytes | None) -> str | None:
+    """Try one model with retries. Returns text on success, None on quota/network failure."""
+    for attempt in range(1, MODEL_MAX_RETRIES + 1):
+        try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}"
+            )
+            resp = requests.post(url, json=body, timeout=90 if image_bytes else 60)
+            if _is_retryable_status(resp.status_code):
+                if attempt < MODEL_MAX_RETRIES:
+                    wait = _backoff_delay(attempt)
+                    print(f"[gemini] {model} HTTP {resp.status_code}, backing off {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                print(f"[gemini] {model} quota exhausted - switching model")
+                return None
+            resp.raise_for_status()
+            result = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            time.sleep(API_PACE_DELAY)
+            return result
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            wait = _backoff_delay(attempt)
+            print(f"[gemini] {model} network error ({type(exc).__name__}), backing off {wait:.1f}s")
+            time.sleep(wait)
+    return None
+
+
+def call_gemini(prompt: str, image_bytes: bytes = None) -> str:
+    """Call Gemini for text or vision generation with multi-model quota fallback."""
+    body = _build_gemini_body(prompt, image_bytes)
     for model in GEMINI_MODELS:
-        for attempt in range(1, MODEL_MAX_RETRIES + 1):
-            try:
-                resp = requests.post(_gemini_url(model), json=body, timeout=90)
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    if attempt < MODEL_MAX_RETRIES:
-                        time.sleep(_gemini_backoff_wait(resp, attempt))
-                        continue
-                    break  # next model
-                resp.raise_for_status()
-                return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout):
-                time.sleep(_gemini_backoff_wait(None, attempt))
-    # Fail-closed: if the vision API is unreachable we cannot verify the text.
-    return "VERDICT: BAD - vision QA unavailable (Gemini API failed on all models)"
+        result = _call_single_model(model, body, image_bytes)
+        if result is not None:
+            return result
+    raise RuntimeError("Gemini API failed on all models")
 
 
-def check_image_spelling(image_bytes: bytes, mime_type: str) -> tuple[bool, str]:
-    """Returns (ok, issues). ok=True means visible text is spelled, readable, and grammatical."""
-    try:
-        reply = call_gemini_vision(image_bytes, mime_type, image_qa_prompt())
-    except Exception as e:
-        # Fail-closed: an unverifiable image must not be accepted as clean.
-        print(f"[image-qa] vision check failed ({e}) - treating as BAD")
-        return False, f"vision QA unavailable: {e}"
-    upper = reply.upper()
-    # Fail-closed: accept ONLY an explicit VERDICT: OK. A missing, garbled or
-    # unexpected verdict is treated as BAD so the image gets re-rendered.
-    ok = "VERDICT: OK" in upper and "VERDICT: BAD" not in upper
-    issues = ""
+def _parse_qa_issues(reply: str) -> str:
+    """Extract ISSUES line from QA reply."""
     for line in reply.splitlines():
-        stripped = line.strip().upper()
-        if stripped.startswith("ISSUES:"):
-            issues = line.split(":", 1)[1].strip()
-            if issues.lower() == "none":
-                issues = ""
-        elif stripped.startswith("TEXTS:") and not issues:
-            # fall back to the transcription when ISSUES: is missing/empty
-            transcription = line.split(":", 1)[1].strip()
-            if transcription and transcription.lower() != "none":
-                issues = f"check these fragments: {transcription}"
-    return ok, issues
+        stripped = line.strip()
+        if stripped.upper().startswith("ISSUES:"):
+            issues = stripped.split(":", 1)[1].strip()
+            return "" if issues.lower() == "none" else issues
+    return ""
 
+
+def check_image_spelling(image_bytes: bytes) -> tuple[bool, str]:
+    """Returns (ok, issues). ok=True means visible text is spelled correctly."""
+    try:
+        reply = call_gemini(image_qa_prompt(), image_bytes)
+    except Exception as exc:
+        return False, f"vision QA unavailable: {exc}"
+    upper = reply.upper()
+    ok = "VERDICT: OK" in upper and "VERDICT: BAD" not in upper
+    return ok, _parse_qa_issues(reply)
+
+
+
+def _fetch_feed_titles(feed_url: str) -> list[str]:
+    """Fetch one RSS feed with timeout, return up to 5 titles."""
+    try:
+        resp = requests.get(feed_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
+        return [entry.title for entry in feed.entries[:5]]
+    except Exception:
+        return []
 
 
 def get_topic_pool() -> list[str]:
     """Combine live headlines from ALL domain RSS feeds with the evergreen lists into one pool"""
-    pool = list(ALL_EVERGREEN_TOPICS)  # static fallback is always included
+    pool = list(ALL_EVERGREEN_TOPICS)
     for feed_url in ALL_RSS_FEEDS:
-        try:
-            feed = feedparser.parse(feed_url, request_headers={"User-Agent": "Mozilla/5.0"})
-            pool.extend(entry.title for entry in feed.entries[:5])
-        except Exception:
-            continue  # if one feed fails, try the others; don't break the whole pipeline
+        pool.extend(_fetch_feed_titles(feed_url))
     return pool
 
 
@@ -297,9 +275,7 @@ CLICHES = [
     "in the realm of", "tapestry", "navigate the landscape", "supercharge",
 ]
 
-def critique_post(state: PipelineState) -> PipelineState:
-    text = state["post_text"]
-    raw = call_gemini(critique_prompt(text))
+def _parse_critique_response(raw: str) -> tuple[int, str]:
     score, feedback = 5, ""
     in_feedback = False
     for line in raw.splitlines():
@@ -311,29 +287,43 @@ def critique_post(state: PipelineState) -> PipelineState:
             in_feedback = False
         elif upper.startswith("FEEDBACK:"):
             feedback = stripped.split(":", 1)[1].strip()
-            in_feedback = True  # feedback may continue on following lines - keep it all
+            in_feedback = True
         elif in_feedback and stripped:
             feedback += " " + stripped
+    return score, feedback
 
-    # Deterministic penalty: known AI cliches instantly cap the score below the revision gate
-    lower = text.lower()
-    hits = [c for c in CLICHES if c in lower]
-    if hits:
-        score = min(score, 5)
-        feedback = f"Remove these overused AI phrases: {', '.join(hits)}. " + (feedback or "")
-    # Deterministic penalty: missing final hashtag line means the format contract was broken
-    if not any(word.startswith("#") for word in text.split()[-8:]):
-        score = min(score, 5)
-        feedback = "The mandatory final hashtag line is missing. " + (feedback or "")
-    # Deterministic penalty: too few emojis -> flat caption. Count via the unicode emoji range.
-    emoji_count = sum(1 for ch in text if ord(ch) > 0x2190)
-    if emoji_count < 4:
-        score = min(score, 6)
-        feedback = (
-            f"Only {emoji_count} emojis found - add 5-7 expressive ones (one per paragraph) "
-            "to give the post energy. " + (feedback or "")
-        )
 
+def _apply_cliche_penalty(text: str, score: int, feedback: str) -> tuple[int, str]:
+    hits = [c for c in CLICHES if c in text.lower()]
+    if not hits:
+        return score, feedback
+    return min(score, 5), f"Remove these overused AI phrases: {', '.join(hits)}. " + (feedback or "")
+
+
+def _apply_hashtag_penalty(text: str, score: int, feedback: str) -> tuple[int, str]:
+    if any(word.startswith("#") for word in text.split()[-8:]):
+        return score, feedback
+    return min(score, 5), "The mandatory final hashtag line is missing. " + (feedback or "")
+
+
+def _apply_emoji_penalty(text: str, score: int, feedback: str) -> tuple[int, str]:
+    emoji_count = sum(1 for ch in text if unicodedata.category(ch) == "So")
+    if emoji_count >= 4:
+        return score, feedback
+    msg = (
+        f"Only {emoji_count} emojis found - add 5-7 expressive ones (one per paragraph) "
+        "to give the post energy. " + (feedback or "")
+    )
+    return min(score, 6), msg
+
+
+def critique_post(state: PipelineState) -> PipelineState:
+    text = state["post_text"]
+    raw = call_gemini(critique_prompt(text))
+    score, feedback = _parse_critique_response(raw)
+    score, feedback = _apply_cliche_penalty(text, score, feedback)
+    score, feedback = _apply_hashtag_penalty(text, score, feedback)
+    score, feedback = _apply_emoji_penalty(text, score, feedback)
     state["critique_score"] = score
     state["critique_feedback"] = feedback.strip()
     print(f"[critic] score={score}/10 | feedback={state['critique_feedback'][:120]}")
@@ -386,179 +376,219 @@ def route_after_uniqueness(state: PipelineState) -> str:
     return "pick_topic"
 
 
-# ---- Image generation via Cloudflare Workers AI (REST endpoint) ----
-JPEG_MIME = "image/jpeg"  # default MIME for all Workers AI image responses (SonarQube S1192)
-CF_FLUX2_KLEIN = "@cf/black-forest-labs/flux-2-klein-4b"  # ultra-fast distilled FLUX.2 (default)
-CF_FLUX2_DEV = "@cf/black-forest-labs/flux-2-dev"        # higher quality, slower fallback
-CF_FLUX1_SCHNELL = "@cf/black-forest-labs/flux-1-schnell"  # fast fallback
-CF_SDXL_MODEL = "@cf/stabilityai/stable-diffusion-xl-base-1.0"  # last resort
+# ---- Image generation via Cloudflare Workers AI ----
+JPEG_MIME = "image/jpeg"
+IMAGE_QA_MAX_ATTEMPTS = 3
+
+CF_MODELS = {
+    "@cf/black-forest-labs/flux-2-klein-4b": {"steps": 8, "width": 1024, "height": 1024, "guidance": 3.5},
+    "@cf/black-forest-labs/flux-2-dev": {"steps": 8, "width": 1024, "height": 1024, "guidance": 3.5},
+    "@cf/black-forest-labs/flux-1-schnell": {"steps": 8},
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0": {},
+}
 
 
 def _run_cf_model(model: str, prompt: str) -> tuple[bytes, str]:
-    """Call one Cloudflare Workers AI image model; returns (image_bytes, content_type).
-
-    Raises RuntimeError with the API error message on any non-200 response.
-    """
+    """Call one Cloudflare Workers AI image model."""
     import base64
-    url = (
-        f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
-        f"/ai/run/{model}"
-    )
-    if model in (CF_FLUX2_KLEIN, CF_FLUX2_DEV):
-        # FLUX.2 models require multipart/form-data and return JSON {result: {image: base64}}
-        resp = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {CLOUDFLARE_API_KEY}"},
-            files={
-                "prompt": (None, prompt),
-                "steps": (None, "8"),
-                "width": (None, "1024"),
-                "height": (None, "1024"),
-                "guidance": (None, "3.5"),
-                "seed": (None, str(secrets.randbelow(2_147_483_647))),  # crypto-safe seed (SonarQube S2245)
-            },
-            timeout=180,
-        )
-    elif model == CF_FLUX1_SCHNELL:
-        # flux-1-schnell's JSON schema only accepts prompt + steps; returns raw image bytes
-        resp = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"prompt": prompt, "steps": 8},
-            timeout=180,
-        )
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{model}"
+    params = CF_MODELS.get(model, {})
+    is_flux2 = "flux-2" in model
+
+    if is_flux2:
+        resp = requests.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_KEY}"},
+                             files={"prompt": (None, prompt), **{k: (None, str(v)) for k, v in params.items()}})
     else:
-        resp = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"prompt": prompt},
-            timeout=180,
-        )
+        resp = requests.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
+                                           "Content-Type": "application/json"},
+                             json={"prompt": prompt, **params})
+
     if resp.status_code != 200:
-        try:
-            detail = resp.json().get("errors", resp.text[:300])
-        except Exception:
-            detail = resp.text[:300]
-        raise RuntimeError(f"Cloudflare {model} error {resp.status_code}: {detail}")
+        raise RuntimeError(f"Cloudflare {model} error {resp.status_code}: {resp.text[:300]}")
+
     content_type = resp.headers.get("Content-Type", JPEG_MIME)
     if "image" in content_type:
         return resp.content, content_type
-    # JSON-wrapped result: {"result": {"image": "<base64>"}}
+    b64 = (resp.json().get("result") or {}).get("image")
+    if b64:
+        return base64.b64decode(b64), JPEG_MIME
+    raise RuntimeError(f"Cloudflare {model} returned non-image: {content_type}")
+
+
+def _normalize_to_png(img: bytes, ctype: str) -> tuple[bytes, str]:
+    """Ensure image bytes are PNG."""
+    if "png" in ctype:
+        return img, ctype
+    with Image.open(io.BytesIO(img)) as im:
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return buf.getvalue(), IMAGE_PNG_MIME
+
+
+def _log_qa_result(attempt: int, ok: bool, issues: str) -> None:
+    label = "flux-2-dev" if attempt >= 2 else "flux-2-klein"
+    status = "OK" if ok else "BAD"
+    suffix = f" - {issues}" if issues else ""
+    print(f"[image-qa] attempt {attempt} [{label}]: {status}{suffix}")
+
+
+def _try_single_model_qa(model: str, prompt: str, attempt: int, errors: list) -> tuple[bytes, str, bool] | None:
+    """Try one model, run QA. Returns (bytes, ctype, is_ok) or None on network error."""
     try:
-        payload = resp.json()
-        b64 = (payload.get("result") or {}).get("image")
-        if b64:
-            return base64.b64decode(b64), JPEG_MIME
-    except Exception:
-        pass
-    raise RuntimeError(f"Cloudflare {model} returned non-image response: {content_type}")
+        img, ctype = _run_cf_model(model, prompt)
+    except Exception as exc:
+        errors.append(str(exc))
+        print(f"[image] {exc} - trying next model...")
+        return None
+    img, ctype = _normalize_to_png(img, ctype)
+    ok, issues = check_image_spelling(img)
+    _log_qa_result(attempt, ok, issues)
+    if not ok:
+        errors.append(f"{model}: {issues}")
+    return img, ctype, ok
 
 
-# ---- Node 6: Generate the image - Cloudflare Workers AI (klein-4b, then dev/schnell/SDXL) ----
-IMAGE_QA_MAX_ATTEMPTS = 3   # normal -> fewer labels -> text-free (spelling-proof, neuron-friendly)
-
-
-def _generate_via_models(prompt: str, errors: list, attempt: int = 1) -> tuple | None:
-    """Try Cloudflare models in order; return (bytes, content_type) or None.
-
-    Attempt 1 uses the cheap-first chain (klein-4b). On QA-failed retries we
-    lead with the BEST text-rendering model (flux-2-dev) so the re-render has
-    the strongest chance of spelling the text correctly.
-    """
-    if attempt >= 2:
-        models = (CF_FLUX2_DEV, CF_FLUX2_KLEIN, CF_FLUX1_SCHNELL, CF_SDXL_MODEL)
-    else:
-        models = (CF_FLUX2_KLEIN, CF_FLUX2_DEV, CF_FLUX1_SCHNELL, CF_SDXL_MODEL)
-    for model in models:
-        try:
-            return _run_cf_model(model, prompt)
-        except Exception as e:
-            errors.append(str(e))
-            print(f"[image] {e} - trying next model...")
-    return None
-
-
-def _build_retry_prompt(full_prompt: str, issues: str, attempt: int) -> str:
-    """Escalating re-render prompt after a QA failure - attempt 3 is text-free,
-    which makes spelling mistakes physically possible to avoid while saving neurons."""
-    if attempt >= 3:
-        # Last resort: strip ALL text - typography is where image models fail most
-        return (
-            f"{full_prompt}\n\nCRITICAL: previous renders kept misspelling or garbling "
-            f"text ({issues}). Render the SAME visual concept with ABSOLUTELY NO text, "
-            f"letters, numbers, words, signs or captions anywhere in the image. Use only "
-            f"icons, symbols, shapes, arrows, charts and illustrations to convey the idea. "
-            f"An image with zero characters cannot have typos - enforce zero characters."
-        )
-    max_labels = 3 if attempt == 2 else 4
-    return (
-        f"{full_prompt}\n\nIMPORTANT: previous render contained misspelled, garbled, "
-        f"duplicated or invented text ({issues}). Re-render with AT MOST {max_labels} "
-        f"DIFFERENT text fragments (1-3 words each, no duplicates), spell every quoted "
-        f"word letter-for-letter correctly using common, simple English words only. "
-        f"Prefer icons and illustrations over text."
-    )
-
-
-def _normalize_to_png(image_bytes: bytes, content_type: str) -> tuple[bytes, str]:
-    """Return PNG bytes for cleaner text QA and final upload quality."""
-    if "png" in (content_type or "").lower():
-        return image_bytes, "image/png"
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            out = io.BytesIO()
-            img.save(out, format="PNG")
-            return out.getvalue(), "image/png"
-    except Exception:
-        return image_bytes, content_type
-
-
-def _render_best_image(full_prompt: str, errors: list) -> tuple | None:
-    """Generate + Gemini QA up to IMAGE_QA_MAX_ATTEMPTS; keep the best render."""
-    best = None
-    prompt = full_prompt
+def _generate_image_with_qa(prompt: str, errors: list) -> tuple | None:
+    """Try Cloudflare models with QA check. Returns best render, fallback to BAD if needed."""
+    models = ("@cf/black-forest-labs/flux-2-klein-4b", "@cf/black-forest-labs/flux-2-dev",
+              "@cf/black-forest-labs/flux-1-schnell", "@cf/stabilityai/stable-diffusion-xl-base-1.0")
+    best: tuple[bytes, str] | None = None
     for attempt in range(1, IMAGE_QA_MAX_ATTEMPTS + 1):
-        generated = _generate_via_models(prompt, errors, attempt)
-        if generated is None:
-            return best
-        img, ctype = generated
-        qa_img, qa_ctype = _normalize_to_png(img, ctype)
-        ok, issues = check_image_spelling(qa_img, qa_ctype)
-        model_used = "flux-2-dev (best)" if attempt >= 2 else "flux-2-klein-4b (fast)"
-        print(f"[image-qa] attempt {attempt} [{model_used}]: {'OK' if ok else 'BAD text'} "
-              f"{('- ' + issues) if issues else ''}")
-        if ok:
-            return qa_img, qa_ctype
-        best = (qa_img, qa_ctype)  # keep the latest failed attempt as fallback
-        prompt = _build_retry_prompt(full_prompt, issues, attempt + 1)
+        for model in models:
+            result = _try_single_model_qa(model, prompt, attempt, errors)
+            if result is None:
+                continue  # network error, try next model
+            img, ctype, is_ok = result
+            if is_ok:
+                return img, ctype
+            # QA failed but we have a BAD image - keep as fallback and try next attempt
+            best = (img, ctype)
+            break  # BAD spelling, try next attempt with fresh generation
+    if best is not None:
+        print(f"[image-qa] all {IMAGE_QA_MAX_ATTEMPTS} attempts had spelling issues - using best BAD render as fallback")
     return best
+
+
+def _extract_text_and_clean_prompt(image_prompt: str) -> tuple[dict, str]:
+    """Extract text elements from prompt and return a text-free version."""
+    matches = _EXACT_TEXT_RE.findall(image_prompt)
+    elements = {"headline": matches[0] if matches else "", "labels": matches[1:]}
+    clean = _CLEAN_TEXT_RE.sub("", image_prompt)
+    clean += "\n\nNO TEXT: render only icons/visuals, leave blank spaces for text overlay."
+    return elements, clean.strip()
+
+
+def _load_font(size: int):
+    """Load a truetype font or fallback to default."""
+    for path in ["C:/Windows/Fonts/arialbd.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
+        try:
+            return ImageFont.truetype(path, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def _draw_outlined_text(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, font) -> None:
+    for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
+        draw.text((x + dx, y + dy), text, font=font, fill="black")
+    draw.text((x, y), text, font=font, fill="white")
+
+
+def _draw_headline(draw: ImageDraw.ImageDraw, w: int, h: int, headline: str, font) -> None:
+    text = headline.upper()
+    bbox = draw.textbbox((0, 0), text, font=font)
+    x = (w - (bbox[2] - bbox[0])) // 2
+    y = int(h * 0.06)
+    _draw_outlined_text(draw, x, y, text, font)
+
+
+def _draw_labels(draw: ImageDraw.ImageDraw, w: int, h: int, labels: list[str], font) -> None:
+    small_font = _load_font(max(16, int(w * 0.03)))
+    # fallback to main font if default was returned and small font failed (already handled)
+    count = len(labels)
+    for i, label in enumerate(labels[:6]):
+        bbox = draw.textbbox((0, 0), label, font=small_font)
+        x = (w - (bbox[2] - bbox[0])) // 2
+        y = int(h * (0.4 + 0.4 * i / max(count, 1)))
+        _draw_outlined_text(draw, x, y, label, small_font)
+
+
+def _overlay_text(image_bytes: bytes, elements: dict) -> bytes:
+    """Overlay headline and labels onto image using PIL."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    font = _load_font(max(28, int(w * 0.055)))
+    if elements["headline"]:
+        _draw_headline(draw, w, h, elements["headline"], font)
+    if elements["labels"]:
+        _draw_labels(draw, w, h, elements["labels"], font)
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG")
+    return out.getvalue()
+
+def _try_apply_overlay(image_bytes: bytes, content_type: str, ext: str, elements: dict) -> tuple[bytes, str, str]:
+    if not (elements["headline"] or elements["labels"]):
+        return image_bytes, content_type, ext
+    try:
+        new_bytes = _overlay_text(image_bytes, elements)
+        print("[image] text overlay applied")
+        return new_bytes, IMAGE_PNG_MIME, "png"
+    except Exception as exc:
+        print(f"[image] overlay failed ({exc})")
+        return image_bytes, content_type, ext
+
+
+def _ensure_png_output(image_bytes: bytes, content_type: str, ext: str) -> tuple[bytes, str, str]:
+    if "png" in content_type:
+        return image_bytes, content_type, ext
+    new_bytes, new_ctype = _normalize_to_png(image_bytes, content_type)
+    return new_bytes, new_ctype, "png"
+
+
+def _create_placeholder_image() -> bytes:
+    """Create a neutral 1024x1024 placeholder when all Cloudflare attempts fail."""
+    img = Image.new("RGB", (1024, 1024), color=(245, 245, 240))
+    draw = ImageDraw.Draw(img)
+    # subtle grid to keep infographic feel even without model
+    for i in range(0, 1024, 128):
+        draw.line([(i, 0), (i, 1024)], fill=(230, 230, 225), width=1)
+        draw.line([(0, i), (1024, i)], fill=(230, 230, 225), width=1)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _create_cloudflare_image(clean_prompt: str, elements: dict, errors: list) -> tuple[bytes | None, str]:
+    best = _generate_image_with_qa(clean_prompt, errors)
+    if not best:
+        return None, "jpg"
+    image_bytes, content_type = best
+    ext = "jpg"
+    image_bytes, content_type, ext = _try_apply_overlay(image_bytes, content_type, ext, elements)
+    image_bytes, content_type, ext = _ensure_png_output(image_bytes, content_type, ext)
+    return image_bytes, ext
 
 
 def generate_image(state: PipelineState) -> PipelineState:
     full_prompt = state["image_prompt"].strip()
-    image_bytes = None
-    ext = "jpg"
-    errors = []
-
-    if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_KEY:
-        print(f"[image] Cloudflare Workers AI ({CF_FLUX2_KLEIN}) | prompt: {full_prompt[:200]}...")
-        best = _render_best_image(full_prompt, errors)
-        if best:
-            image_bytes, content_type = best
-            image_bytes, content_type = _normalize_to_png(image_bytes, content_type)
-            ext = "png" if "png" in content_type else "jpg"
-    else:
+    errors: list[str] = []
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_KEY:
         errors.append("CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY missing from .env")
-
+        raise RuntimeError(f"Image generation failed: {'; '.join(errors)}")
+    elements, clean_prompt = _extract_text_and_clean_prompt(full_prompt)
+    print(f"[image] Cloudflare Workers AI | prompt: {clean_prompt[:200]}...")
+    print(f"[image] overlay: \"{elements['headline']}\" + {len(elements['labels'])} labels")
+    image_bytes, ext = _create_cloudflare_image(clean_prompt, elements, errors)
     if image_bytes is None:
-        raise RuntimeError(f"Image generation failed on all Cloudflare models: {'; '.join(errors)}")
-
+        # ultimate fallback: don't crash pipeline, post placeholder with overlay
+        print(f"[image] all Cloudflare attempts failed ({'; '.join(errors)[:200]}) - using placeholder")
+        image_bytes = _create_placeholder_image()
+        try:
+            image_bytes = _overlay_text(image_bytes, elements)
+        except Exception as exc:
+            print(f"[image] placeholder overlay failed ({exc})")
+        ext = "png"
     image_path = os.path.join(IMAGES_DIR, f"post_image_{int(time.time())}.{ext}")
     with open(image_path, 'wb') as file:
         file.write(image_bytes)
@@ -579,23 +609,17 @@ def post_to_linkedin(state: PipelineState) -> PipelineState:
 
 # ---- Node 8: Save history (plain text JSON + ChromaDB, for duplicate detection next time) ----
 def save_history(state: PipelineState) -> PipelineState:
-    # Append to the plain-text history file (git-friendly; survives GitHub Actions runs).
     history = []
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 history = json.load(f)
         except (json.JSONDecodeError, OSError):
-            history = []
+            pass
     history.append(state["post_text"])
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False)
-
-    # Also add to the ChromaDB collection (used live for uniqueness within this run).
-    collection.add(
-        documents=[state["post_text"]],
-        ids=[f"post_{collection.count() + 1}"],
-    )
+    collection.add(documents=[state["post_text"]], ids=[f"post_{collection.count() + 1}"])
     print(f"[history] saved {len(history)} posts to posts_history.json")
     return state
 

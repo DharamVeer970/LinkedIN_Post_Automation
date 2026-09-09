@@ -64,17 +64,17 @@ pick_topic ──► generate_content ──► critique_post ───┐
 ```
 
 **Nodes in `linkedin_pipeline.py`:**
-| Node | File:Line | Description |
-|---|---|---|
-| `pick_topic` | `linkedin_pipeline.py:266` | Random from `get_topic_pool()` (RSS + evergreen), avoids `tried_topics` |
-| `generate_content` | `linkedin_pipeline.py:280` | `call_gemini(content_prompt())` |
-| `critique_post` | `linkedin_pipeline.py:293` | LLM critic + deterministic penalties (clichés, hashtags, emojis) |
-| `revise_content` | `linkedin_pipeline.py:347` | `call_gemini(revise_prompt())` |
-| `generate_image_prompt` | `linkedin_pipeline.py:356` | `call_gemini(image_prompt_gen())` — 7 templates |
-| `check_uniqueness` | `linkedin_pipeline.py:363` | `collection.query()` cosine distance |
-| `generate_image` | `linkedin_pipeline.py:500` | Cloudflare Workers AI `POST /accounts/{id}/ai/run/@cf/black-forest-labs/flux-2-klein-4b` |
-| `post_to_linkedin` | `linkedin_pipeline.py:527` | `linkedin_poster.py:52,62,78,86` |
-| `save_history` | `linkedin_pipeline.py:537` | Appends to history + ChromaDB |
+| Node | Description |
+|---|---|
+| `pick_topic` | Random from `get_topic_pool()` (RSS + evergreen), avoids `tried_topics` |
+| `generate_content` | `call_gemini(content_prompt())` |
+| `critique_post` | LLM critic + deterministic penalties (clichés, hashtags, emojis) |
+| `revise_content` | `call_gemini(revise_prompt())` |
+| `generate_image_prompt` | `call_gemini(image_prompt_gen())` — 7 templates |
+| `check_uniqueness` | `collection.query()` cosine distance |
+| `generate_image` | Cloudflare Workers AI with PIL text overlay |
+| `post_to_linkedin` | `linkedin_poster.py` upload + create post |
+| `save_history` | Appends to history + ChromaDB |
 
 ---
 
@@ -92,7 +92,7 @@ Gemini chooses **exactly one** per post. Defined in `post_prompts.py:190` `VIRAL
 | `animated-image` | Multi-panel story progression | 6-panel story flow, clean vector cartoon, speech bubbles ≤8 words |
 | `automation-flow-diagram` | Process / workflow automation | Clear flowchart with connecting lines, simple background, step-by-step |
 
-Prompt rule `post_prompts.py:323`: **every word in the image must come from the caption** — no generic labels. Ends with `crisp vector, 8k, ultra-detailed, perfectly legible English`.
+**Text overlay:** Image is generated text-free, then PIL renders headline + labels with perfect spelling.
 
 ---
 
@@ -138,7 +138,7 @@ pillow>=10.0
 
 | Var | Source | Required | Notes |
 |---|---|---|---|
-| `GEMINI_API_KEY` | https://aistudio.google.com/apikey | ✅ | Gemini 3.6 Flash + 3.1 Flash Lite fallback (`linkedin_pipeline.py:67`) |
+| `GEMINI_API_KEY` | https://aistudio.google.com/apikey | ✅ | Gemini 3.6 Flash + 3.1 Flash Lite fallback |
 | `CLOUDFLARE_ACCOUNT_ID` | https://dash.cloudflare.com (Workers & Pages → sidebar) | ✅ | Cloudflare account ID |
 | `CLOUDFLARE_API_KEY` | https://dash.cloudflare.com/profile/api-tokens | ✅ | API token with **Workers AI: Edit** permission (`linkedin_pipeline.py:59`) |
 | `LINKEDIN_TOKEN` | `linkedin_poster.py:26` OAuth | ✅ | ~60 days validity |
@@ -184,11 +184,11 @@ All prompts & domains live in **`post_prompts.py`** — edit that file only:
 | `GEMINI_API_KEY or LINKEDIN_TOKEN missing` | Check `.env` exists and is loaded (`load_dotenv()`); on Actions check Secrets names match exactly |
 | `Cloudflare ... error 401/403` | Wrong/expired API token — create one at dash.cloudflare.com/profile/api-tokens with **Workers AI: Edit** permission |
 | `Cloudflare ... error 7003/7000` (no route) | Wrong `CLOUDFLARE_ACCOUNT_ID` — copy it from Workers & Pages sidebar |
-| `429 Gemini` / `model not found` | Pipeline auto-retries with jitter, then falls back across `GEMINI_MODELS` (`linkedin_pipeline.py:67`). If persistent, wait for quota reset |
+| `429 Gemini` / `model not found` | Pipeline auto-retries with jitter, then falls back across `GEMINI_MODELS`. If persistent, wait for quota reset |
 | `Cloudflare 429: daily free allocation of neurons` | Workers AI free tier = 10,000 neurons/day (resets midnight PT). Each image costs neurons; QA retries cost more. Wait for reset or upgrade to Workers Paid |
 | `Not authorized / Invalid token` | LinkedIn token expired (~60d). Re-run `python linkedin_poster.py` and update `.env` + GitHub Secret `LINKEDIN_TOKEN` |
 | ChromaDB empty on Actions | Ensure `posts_history.json` is committed — `_seed_from_history()` needs it |
-| Image text gibberish | Keep bubble/label fragments ≤8 words (enforced in templates) — Cloudflare FLUX renders short text best |
+| Image text gibberish | Fixed: images are text-free, PIL overlays perfect text |
 
 ---
 
