@@ -185,7 +185,7 @@ ALL_EVERGREEN_TOPICS = [t for d in TOPIC_DOMAINS.values() for t in d["evergreen"
 #    as-is + seed. No random style layering.
 # ====================================================================
 
-# 5 proven viral templates - reverse-engineered from your examples
+# 15 proven viral templates - reverse-engineered from LinkedIn top posts
 VIRAL_TEMPLATES = {
     "comic": (
         "6-panel comic strip, 3 rows x 2 columns, thick black panel borders, "
@@ -226,11 +226,50 @@ VIRAL_TEMPLATES = {
         "crisp vector, 8k, ultra-detailed, perfectly legible English, "
         "showing a smooth flow of the story in each panel, with a clear beginning, middle, and end, "
     ),
-
     "automation-flow-diagram": (
         "automation flow diagram, matching background with lines, don't overcrowd, clear and simple, "
         "with a clear beginning, middle, and end, "
         "with clearly moving cutting-edge lines connecting each process to the next, "
+    ),
+    # --- New wide-variety LinkedIn-native templates ---
+    "timeline": (
+        "horizontal timeline infographic, left-to-right chronological flow with 5-6 circular "
+        "milestone nodes connected by thick line, dated labels below each node, soft gradient "
+        "background, premium vector, perfectly legible English, clean LinkedIn timeline style"
+    ),
+    "pyramid": (
+        "pyramid hierarchy infographic, stacked triangular levels with bold level titles and small "
+        "icons inside each tier, subtle drop shadows, cream-beige background, crisp vector editorial, "
+        "perfectly legible English labels, LinkedIn framework style"
+    ),
+    "stats_dashboard": (
+        "stats dashboard infographic, 4 large metric cards in 2x2 grid with huge bold numbers, "
+        "small icons, colored trend arrows and mini sparklines, dark navy header, light background, "
+        "premium corporate vector, perfectly legible English, viral LinkedIn stats post"
+    ),
+    "matrix_2x2": (
+        "2x2 matrix quadrant infographic, four quadrants with bold headers, icons and 2 bullet points each, "
+        "central cross lines, muted color coding per quadrant, clean minimal vector, perfectly legible English, "
+        "LinkedIn framework post style"
+    ),
+    "checklist": (
+        "checklist infographic, vertical list of 5-6 items with green checkmark circles, bold item titles "
+        "and one-line descriptions, subtle divider lines, off-white card, minimal vector, perfectly legible English, "
+        "viral LinkedIn checklist style"
+    ),
+    "venn_diagram": (
+        "3-circle Venn diagram infographic, overlapping translucent pastel circles with centered labels "
+        "and intersection tags, soft colors, white background, clean vector, perfectly legible English, LinkedIn explainer"
+    ),
+    "funnel": (
+        "vertical funnel infographic, top-wide to bottom-narrow 4 stages with icons and 2-word labels, "
+        "downward arrows, gradient fill from teal to navy, white background, crisp vector, perfectly legible English, "
+        "LinkedIn marketing funnel style"
+    ),
+    "quote_card": (
+        "bold quote card infographic, huge centered serif quote text occupying 50% canvas, attribution line below, "
+        "minimal geometric accent, off-white paper texture, high contrast black text, viral LinkedIn quote style, "
+        "perfectly legible English"
     ),
 }
 
@@ -297,7 +336,7 @@ def revise_prompt(post_text: str, feedback: str) -> str:
 
 def image_prompt_gen(post_text: str) -> str:
     return (
-        "You are a viral LinkedIn art director. Pick EXACTLY ONE template and write "
+        "You are a viral LinkedIn art director. Pick EXACTLY ONE template (15 choices) and write "
         "ONE ready-to-use image prompt (60-80 words, comma phrases).\n\n"
         "TEMPLATE A - COMIC (humor/relatable/AI fails):\n"
         f"\"{VIRAL_TEMPLATES['comic']}\" + describe 6 panels + EXACT speech bubble texts (5-8 words each, funny, FROM the post)\n\n"
@@ -309,6 +348,26 @@ def image_prompt_gen(post_text: str) -> str:
         f"\"{VIRAL_TEMPLATES['sketch_story']}\" + bridge metaphor, annotations, 3 levels, ALL TEXT FROM post\n\n"
         "TEMPLATE E - BILLBOARD (listicles like 'How to stay poor', 5-6 habits):\n"
         f"\"{VIRAL_TEMPLATES['billboard']}\" + huge headline + 6 icons with labels, ALL TEXT FROM post\n\n"
+        "TEMPLATE F - TIMELINE (journey/process over time):\n"
+        f"\"{VIRAL_TEMPLATES['timeline']}\" + 5-6 milestone nodes with dates/labels, ALL TEXT FROM post\n\n"
+        "TEMPLATE G - PYRAMID (hierarchy/framework, e.g. Maslow, tech stack):\n"
+        f"\"{VIRAL_TEMPLATES['pyramid']}\" + stacked levels with titles/icons, ALL TEXT FROM post\n\n"
+        "TEMPLATE H - STATS_DASHBOARD (metrics/KPIs, numbers heavy):\n"
+        f"\"{VIRAL_TEMPLATES['stats_dashboard']}\" + 4 metric cards with huge numbers/icons, ALL TEXT FROM post\n\n"
+        "TEMPLATE I - MATRIX_2X2 (quadrants like Eisenhower, SWOT):\n"
+        f"\"{VIRAL_TEMPLATES['matrix_2x2']}\" + 4 quadrants with headers/bullets, ALL TEXT FROM post\n\n"
+        "TEMPLATE J - CHECKLIST (habits, mistakes, steps):\n"
+        f"\"{VIRAL_TEMPLATES['checklist']}\" + 5-6 check items with titles, ALL TEXT FROM post\n\n"
+        "TEMPLATE K - VENN_DIAGRAM (overlap/intersection concepts):\n"
+        f"\"{VIRAL_TEMPLATES['venn_diagram']}\" + 3 overlapping circles with labels, ALL TEXT FROM post\n\n"
+        "TEMPLATE L - FUNNEL (sales/marketing/process stages):\n"
+        f"\"{VIRAL_TEMPLATES['funnel']}\" + 4 funnel stages with icons/labels, ALL TEXT FROM post\n\n"
+        "TEMPLATE M - QUOTE_CARD (single powerful insight):\n"
+        f"\"{VIRAL_TEMPLATES['quote_card']}\" + one bold quote pulled FROM post, attribution\n\n"
+        "TEMPLATE N - ANIMATED (story flow like comic but animated look):\n"
+        f"\"{VIRAL_TEMPLATES['animated-image']}\" + 6 panels with flow, FROM post\n\n"
+        "TEMPLATE O - AUTOMATION_FLOW (workflows/systems):\n"
+        f"\"{VIRAL_TEMPLATES['automation-flow-diagram']}\" + connected flow steps with icons, FROM post\n\n"
         "CRITICAL CAPTION ALIGNMENT RULE (must follow):\n"
         "- Every word inside the image (bubbles/labels/headers/bullets) MUST be directly "
         "taken from or paraphrased from the Post below. Do NOT invent unrelated labels. "
