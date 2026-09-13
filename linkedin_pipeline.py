@@ -90,10 +90,11 @@ API_PACE_DELAY = 5.0                           # min seconds between consecutive
 # ---- Shared constants (Sonar S1192) ----
 IMAGE_PNG_MIME = "image/png"
 
-# Pre-compiled, linear regexes for image-prompt text extraction (Sonar S8786)
-# Linear - no nested/optional quantifiers; matches `exact text: "X"` from post_prompts.py
-_EXACT_TEXT_RE = re.compile(r'exact text: "([^"]+)"')
-_CLEAN_TEXT_RE = re.compile(r' exact text: "[^"]*"')
+# Pre-compiled, linear regexes for image-prompt text extraction (Sonar S6397/S8786).
+# NOTE: alternation is longest-first ("exact text" before "text").
+_TEXT_KEY = r"(?:exact text|header|title|bubble|label|item|text)"
+_EXACT_TEXT_RE = re.compile(_TEXT_KEY + r"(?: \d+)?: \"([^\"]+)\"", flags=re.IGNORECASE)
+_CLEAN_TEXT_RE = re.compile(" ?" + _TEXT_KEY + r"(?: \d+)?: \"[^\"]*\"", flags=re.IGNORECASE)
 
 if not GEMINI_API_KEY or not LINKEDIN_TOKEN:
     raise ValueError("Set GEMINI_API_KEY and LINKEDIN_TOKEN in your .env file (see .env.example)")
@@ -355,6 +356,25 @@ def _has_overlay_text(image_prompt: str) -> bool:
     return bool(_EXACT_TEXT_RE.search(image_prompt or ""))
 
 
+def _label_ok(cand: str, seen: set[str]) -> bool:
+    """Check one fallback candidate is short, clean and unseen."""
+    words = cand.split()
+    if len(words) < 2 or len(words) > 4 or len(cand) > 32:
+        return False
+    if cand.lower() in seen:
+        return False
+    if any(c in cand for c in ["http", "://", "&", "|", "[", "]", "(", ")"]):
+        return False
+    return bool(re.search(r"[A-Za-z]", cand))
+
+
+def _split_chunks(chunk: str) -> list[str]:
+    """Short lines as-is; long sentences split on commas/conjunctions."""
+    if len(chunk.split()) <= 5:
+        return [chunk]
+    return re.split(r",|;|:| and | or | with | to | instead of ", chunk, flags=re.IGNORECASE)
+
+
 def _fallback_elements(post_text: str, topic: str) -> dict:
     """Build overlay text from the post itself when Gemini forgets exact text fragments.
 
@@ -368,16 +388,17 @@ def _fallback_elements(post_text: str, topic: str) -> dict:
     for line in (post_text or "").splitlines():
         chunk = re.sub(r"[#@*_`>~\-–—\d.)(\[\]]+", " ", line).strip()
         chunk = re.sub(r"\s+", " ", chunk).strip()
-        words = chunk.split()
-        if len(words) < 2 or len(words) > 5:
+        if not chunk:
             continue
-        if len(chunk) > 32 or chunk.lower() in seen:
-            continue
-        if any(c in chunk for c in ["http", "://", "&", "|"]):
-            continue
-        seen.add(chunk.lower())
-        labels.append(chunk)
-        if len(labels) >= 4:
+        # The Python-scripts post had only long lines -> 0 labels before.
+        for part in _split_chunks(chunk):
+            cand = re.sub(r"\s+", " ", part.strip().strip(",;.")).strip()
+            if _label_ok(cand, seen):
+                seen.add(cand.lower())
+                labels.append(cand)
+            if len(labels) >= 6:
+                break
+        if len(labels) >= 6:
             break
     if not headline and labels:
         headline, labels = labels[0], labels[1:]
@@ -633,7 +654,7 @@ _HEADLINE_TEXT = (255, 255, 255, 255)
 _LABEL_TEXT = (17, 24, 39, 255)
 
 
-def _draw_headline_banner(img: Image.Image, draw: ImageDraw.ImageDraw,
+def _draw_headline_banner(draw: ImageDraw.ImageDraw,
                           w: int, h: int, headline: str) -> int:
     """Draw opaque top banner + wrapped headline. Returns banner bottom y.
 
@@ -664,7 +685,53 @@ def _draw_headline_banner(img: Image.Image, draw: ImageDraw.ImageDraw,
     return banner_h
 
 
-def _draw_label_grid(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int,
+def _grid_boxes(n: int, w: int, gap: int, side: int) -> tuple[list, int]:
+    """Compute card boxes + row count for n labels. Extracted to keep complexity low."""
+    if n == 1:
+        return [(side, 0, w - side, 0)], 1
+    import math
+    card_w = (w - 2 * side - gap) // 2
+    if n == 2:
+        return [(side, 0, side + card_w, 0),
+                (side + card_w + gap, 0, w - side, 0)], 1
+    rows = math.ceil(n / 2)
+    boxes = []
+    for r in range(rows):
+        boxes.append((side, r, side + card_w, r))
+        if len(boxes) < n:
+            boxes.append((side + card_w + gap, r, w - side, r))
+    return boxes, rows
+
+
+def _draw_single_card(draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int,
+                      label: str, idx: int, base_font_size: int) -> None:
+    """Draw one opaque card + centered text. Extracted to keep grid complexity low."""
+    # Solid offset shadow (neo-brutalist) then card.
+    # Solid fill (not alpha) because RGBA->RGB conversion turns
+    # semi-transparent black into harsh pure-black edges.
+    draw.rounded_rectangle([(x0 + 4, y0 + 4), (x1 + 4, y1 + 4)],
+                           radius=26, fill=_CARD_SHADOW)
+    draw.rounded_rectangle([(x0, y0), (x1, y1)], radius=26, fill=_CARD_FILL,
+                           outline=_CARD_SHADOW, width=3)
+    # Accent strip inset inside the card so corners never poke out.
+    accent = _CARD_ACCENTS[idx % len(_CARD_ACCENTS)]
+    draw.rectangle([(x0 + 2, y0 + 2), (x1 - 2, y0 + 12)], fill=accent + (255,))
+
+    card_h = y1 - y0
+    max_text_w = (x1 - x0) - 36
+    font = _fit_font(draw, label, base_font_size, max_text_w, min_size=16)
+    lines = _wrap_text(draw, label.upper(), font, max_text_w)[:2]
+    lh = [draw.textbbox((0, 0), ln, font=font)[3] for ln in lines]
+    block_h = sum(lh) + 8 * (len(lines) - 1)
+    ty = y0 + (card_h - block_h) // 2 + 6  # +6 to clear accent strip
+    for ln in lines:
+        bbox = draw.textbbox((0, 0), ln, font=font)
+        tx = x0 + ((x1 - x0) - (bbox[2] - bbox[0])) // 2
+        draw.text((tx, ty), ln, font=font, fill=_LABEL_TEXT)
+        ty += (bbox[3] - bbox[1]) + 8
+
+
+def _draw_label_grid(draw: ImageDraw.ImageDraw, w: int, h: int,
                      labels: list[str], top: int) -> None:
     """Draw labels as opaque cards in an aligned grid below `top`.
 
@@ -679,25 +746,7 @@ def _draw_label_grid(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int
         return
     gap = int(w * 0.035)
     side = int(w * 0.06)
-
-    if n == 1:
-        boxes = [(side, None, w - side, None)]
-    elif n == 2:
-        card_w = (w - 2 * side - gap) // 2
-        boxes = [(side, None, side + card_w, None),
-                 (side + card_w + gap, None, w - side, None)]
-    else:
-        import math
-        rows_needed = math.ceil(n / 2)
-        card_w = (w - 2 * side - gap) // 2
-        boxes = []
-        for r in range(rows_needed):
-            boxes.append((side, r, side + card_w, r))
-            if len(boxes) < n:
-                boxes.append((side + card_w + gap, r, w - side, r))
-        rows = rows_needed
-    if n <= 2:
-        rows = 1
+    boxes, rows = _grid_boxes(n, w, gap, side)
     avail_h = h - top - int(h * 0.04)
     card_h = min(int(h * 0.20), (avail_h - gap * (rows - 1)) // rows)
     # Vertically center the whole grid in the remaining space.
@@ -707,33 +756,9 @@ def _draw_label_grid(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int
     # Smaller text when 5-6 cards share the space (billboard/checklist/roadmap styles).
     base_font_size = max(20, int(w * 0.032)) if n <= 4 else max(16, int(w * 0.026))
     for idx, (label, box) in enumerate(zip(labels, boxes)):
-        x0, _, x1, _ = box
-        row = box[1] if n > 2 else 0
+        x0, row, x1, _ = box
         y0 = start_y + row * (card_h + gap)
-        y1 = y0 + card_h
-
-        # Solid offset shadow (neo-brutalist) then card.
-        # Solid fill (not alpha) because RGBA->RGB conversion turns
-        # semi-transparent black into harsh pure-black edges.
-        draw.rounded_rectangle([(x0 + 4, y0 + 4), (x1 + 4, y1 + 4)],
-                               radius=26, fill=_CARD_SHADOW)
-        draw.rounded_rectangle([(x0, y0), (x1, y1)], radius=26, fill=_CARD_FILL,
-                               outline=_CARD_SHADOW, width=3)
-        # Accent strip inset inside the card so corners never poke out.
-        accent = _CARD_ACCENTS[idx % len(_CARD_ACCENTS)]
-        draw.rectangle([(x0 + 2, y0 + 2), (x1 - 2, y0 + 12)], fill=accent + (255,))
-
-        max_text_w = (x1 - x0) - 36
-        font = _fit_font(draw, label, base_font_size, max_text_w, min_size=16)
-        lines = _wrap_text(draw, label.upper(), font, max_text_w)[:2]
-        lh = [draw.textbbox((0, 0), ln, font=font)[3] for ln in lines]
-        block_h = sum(lh) + 8 * (len(lines) - 1)
-        ty = y0 + (card_h - block_h) // 2 + 6  # +6 to clear accent strip
-        for ln in lines:
-            bbox = draw.textbbox((0, 0), ln, font=font)
-            tx = x0 + ((x1 - x0) - (bbox[2] - bbox[0])) // 2
-            draw.text((tx, ty), ln, font=font, fill=_LABEL_TEXT)
-            ty += (bbox[3] - bbox[1]) + 8
+        _draw_single_card(draw, x0, y0, x1, y0 + card_h, label, idx, base_font_size)
 
 
 def _overlay_text(image_bytes: bytes, elements: dict) -> bytes:
@@ -748,9 +773,9 @@ def _overlay_text(image_bytes: bytes, elements: dict) -> bytes:
     w, h = img.size
     top = 0
     if elements["headline"]:
-        top = _draw_headline_banner(img, draw, w, h, elements["headline"])
+        top = _draw_headline_banner(draw, w, h, elements["headline"])
     if elements["labels"]:
-        _draw_label_grid(img, draw, w, h, elements["labels"], top)
+        _draw_label_grid(draw, w, h, elements["labels"], top)
     out = io.BytesIO()
     img.convert("RGB").save(out, format="PNG")
     return out.getvalue()
