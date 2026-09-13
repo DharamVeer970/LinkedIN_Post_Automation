@@ -337,7 +337,9 @@ def revise_prompt(post_text: str, feedback: str) -> str:
 def image_prompt_gen(post_text: str) -> str:
     return (
         "You are a viral LinkedIn art director. Pick EXACTLY ONE template (15 choices) and write "
-        "ONE ready-to-use image prompt (60-80 words, comma phrases).\n\n"
+        "ONE ready-to-use image prompt (60-80 words, comma phrases).\n"
+        "STRICT OUTPUT FORMAT: output ONLY the visual description starting directly with style words. "
+        "Never write TEMPLATE, never write the template letter/name, never explain your choice.\n\n"
         "TEMPLATE A - COMIC (humor/relatable/AI fails):\n"
         f"\"{VIRAL_TEMPLATES['comic']}\" + describe 6 panels + EXACT speech bubble texts (5-8 words each, funny, FROM the post)\n\n"
         "TEMPLATE B - ROADMAP (tech stacks/tools/skills, e.g. AI Agent Development):\n"
@@ -376,8 +378,10 @@ def image_prompt_gen(post_text: str) -> str:
         "- Choose the ONE template that best fits the post's structure.\n"
         "- Output ONLY the final prompt, no explanation.\n"
         "- Keep each text fragment under 5 words for legibility.\n"
-        "- Use AT MOST 8 separate text fragments in the whole image. Fewer is better - "
-        "text models misspell long text. Prefer icons + 1-3 word labels over sentences.\n"
+        "- Use AT MOST 7 separate text fragments in the whole image (1 headline + max 6 labels). "
+        "Match the template: 3-4 labels for comparison/matrix/stats/funnel/venn, "
+        "5-6 only for comic/billboard/checklist/roadmap/timeline which need more items. "
+        "Fewer is better - text models misspell long text. Prefer icons + 1-3 word labels over sentences.\n"
         "- Every label must be UNIQUE - never repeat the same word or label twice in "
         "the image. Do not add filler icons just to fill a grid; fewer, varied items look better.\n"
         "- Use only simple, common English words that are spelled the way they sound. "

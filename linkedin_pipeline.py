@@ -349,9 +349,53 @@ def revise_content(state: PipelineState) -> PipelineState:
     return state
 
 
-# ---- Node 3: Generate image prompt (agent-driven, 7 templates) ----
+# ---- Node 3: Generate image prompt (agent-driven, 15 templates) ----
+def _has_overlay_text(image_prompt: str) -> bool:
+    """True if Gemini obeyed the format and emitted at least one exact text fragment."""
+    return bool(_EXACT_TEXT_RE.search(image_prompt or ""))
+
+
+def _fallback_elements(post_text: str, topic: str) -> dict:
+    """Build overlay text from the post itself when Gemini forgets exact text fragments.
+
+    Guarantees the image never ships with 0 overlay labels (the roadmap run that
+    posted pure diffusion-baked text). Headline = topic, labels = first short
+    phrases from the post body.
+    """
+    headline = (topic or "").strip().strip("\"'")[:42]
+    labels: list[str] = []
+    seen: set[str] = set()
+    for line in (post_text or "").splitlines():
+        chunk = re.sub(r"[#@*_`>~\-–—\d.)(\[\]]+", " ", line).strip()
+        chunk = re.sub(r"\s+", " ", chunk).strip()
+        words = chunk.split()
+        if len(words) < 2 or len(words) > 5:
+            continue
+        if len(chunk) > 32 or chunk.lower() in seen:
+            continue
+        if any(c in chunk for c in ["http", "://", "&", "|"]):
+            continue
+        seen.add(chunk.lower())
+        labels.append(chunk)
+        if len(labels) >= 4:
+            break
+    if not headline and labels:
+        headline, labels = labels[0], labels[1:]
+    return _sanitize_elements({"headline": headline, "labels": labels})
+
+
 def generate_image_prompt(state: PipelineState) -> PipelineState:
-    state["image_prompt"] = call_gemini(image_prompt_gen(state["post_text"]))
+    prompt = call_gemini(image_prompt_gen(state["post_text"]))
+    if not _has_overlay_text(prompt):
+        # Gemini echoed "TEMPLATE B - ROADMAP: ..." instead of the final prompt
+        # (seen in live run) -> one retry forces the exact-text format.
+        print("[image-prompt] no exact text fragments found, retrying once for format...")
+        prompt = call_gemini(
+            image_prompt_gen(state["post_text"])
+            + "\n\nSTRICT: start directly with the visual description. "
+            'Never write TEMPLATE, never explain. Emit at least 2 fragments as exact text: "Words".'
+        )
+    state["image_prompt"] = prompt
     print(f"[image-prompt] {state['image_prompt'][:160]}...")
     return state
 
@@ -425,11 +469,11 @@ def _normalize_to_png(img: bytes, ctype: str) -> tuple[bytes, str]:
         return buf.getvalue(), IMAGE_PNG_MIME
 
 
-def _log_qa_result(attempt: int, ok: bool, issues: str) -> None:
-    label = "flux-2-dev" if attempt >= 2 else "flux-2-klein"
+def _log_qa_result(attempt: int, model: str, ok: bool, issues: str) -> None:
+    short = model.split("/")[-1] if "/" in model else model
     status = "OK" if ok else "BAD"
     suffix = f" - {issues}" if issues else ""
-    print(f"[image-qa] attempt {attempt} [{label}]: {status}{suffix}")
+    print(f"[image-qa] attempt {attempt} [{short}]: {status}{suffix}")
 
 
 def _try_single_model_qa(model: str, prompt: str, attempt: int, errors: list) -> tuple[bytes, str, bool] | None:
@@ -442,17 +486,22 @@ def _try_single_model_qa(model: str, prompt: str, attempt: int, errors: list) ->
         return None
     img, ctype = _normalize_to_png(img, ctype)
     ok, issues = check_image_spelling(img)
-    _log_qa_result(attempt, ok, issues)
+    _log_qa_result(attempt, model, ok, issues)
     if not ok:
         errors.append(f"{model}: {issues}")
     return img, ctype, ok
 
 
 def _generate_image_with_qa(prompt: str, errors: list) -> tuple | None:
-    """Try Cloudflare models with QA check. Returns best render, fallback to BAD if needed."""
+    """Try Cloudflare models with QA check. Returns ONLY a clean (OK) render.
+
+    Never ships a BAD render with garbled baked-in text - a garbled background
+    plus a PIL overlay is what produced the double-text mess. If every attempt
+    has baked text, return None so the caller falls back to a clean placeholder
+    + crisp PIL cards instead.
+    """
     models = ("@cf/black-forest-labs/flux-2-klein-4b", "@cf/black-forest-labs/flux-2-dev",
               "@cf/black-forest-labs/flux-1-schnell", "@cf/stabilityai/stable-diffusion-xl-base-1.0")
-    best: tuple[bytes, str] | None = None
     for attempt in range(1, IMAGE_QA_MAX_ATTEMPTS + 1):
         for model in models:
             result = _try_single_model_qa(model, prompt, attempt, errors)
@@ -461,26 +510,78 @@ def _generate_image_with_qa(prompt: str, errors: list) -> tuple | None:
             img, ctype, is_ok = result
             if is_ok:
                 return img, ctype
-            # QA failed but we have a BAD image - keep as fallback and try next attempt
-            best = (img, ctype)
-            break  # BAD spelling, try next attempt with fresh generation
-    if best is not None:
-        print(f"[image-qa] all {IMAGE_QA_MAX_ATTEMPTS} attempts had spelling issues - using best BAD render as fallback")
-    return best
+            # BAD = baked garbled text -> discard, never use as fallback.
+            # Continue to next model (fresh background) instead of breaking.
+    print(f"[image-qa] all {IMAGE_QA_MAX_ATTEMPTS} attempts had baked text - "
+          f"discarding garbled renders, will use clean placeholder + overlay")
+    return None
+
+
+# Phrases that make diffusion models attempt (and garble) text. Stripped
+# from the background prompt - ALL real text is drawn later via PIL.
+_TEXT_TRIGGERS_RE = re.compile(
+    r"(perfectly legible English|legible English|readable text|speech bubbles?|"
+    r"text bubbles?|with text|caption labels?|word labels?|headers? with words?|"
+    r"bullet lines?|quote text|attribution line|dated labels?|milestone nodes? with[^,]*|"
+    r"exact word[^,]*|short labels?[^,]*|bold (headers?|titles?|labels?)[^,]*|"
+    r"huge (headline|numbers?|quote)[^,]*|number labels?[^,]*),?",
+    flags=re.IGNORECASE,
+)
+
+_NO_TEXT_SUFFIX = (
+    "ABSOLUTELY NO TEXT, no letters, no words, no numbers, no signs, no captions, "
+    "no speech bubbles, no labels anywhere. Pure abstract background illustration only: "
+    "icons, shapes and empty blank cream panels with generous empty space at the top "
+    "for a title banner and empty cards at the bottom for text overlay. Clean, "
+    "uncluttered, blurred background details so overlaid text stays legible."
+)
+
+
+def _sanitize_elements(elements: dict) -> dict:
+    """Clean + dedupe extracted texts so overlay stays legible and creative."""
+    def _clean_one(s: str, max_words: int = 5, max_chars: int = 32) -> str:
+        s = re.sub(r"\s+", " ", (s or "").strip().strip("\"'")).strip()
+        s = s[:max_chars].strip()
+        words = s.split()
+        if len(words) > max_words:
+            s = " ".join(words[:max_words])
+        return s
+
+    headline = _clean_one(elements.get("headline", ""), max_words=6, max_chars=42)
+    seen: set[str] = set()
+    labels: list[str] = []
+    for raw in elements.get("labels", []) or []:
+        lab = _clean_one(raw)
+        if not lab or lab.lower() in seen:
+            continue
+        seen.add(lab.lower())
+        labels.append(lab)
+        if len(labels) >= 6:  # supports all 15 templates: 2x2 grid (3-4) up to 2x3 grid (5-6 for comic/billboard/checklist/roadmap)
+            break
+    return {"headline": headline, "labels": labels}
 
 
 def _extract_text_and_clean_prompt(image_prompt: str) -> tuple[dict, str]:
-    """Extract text elements from prompt and return a text-free version."""
+    """Extract text elements for PIL overlay and return a STRICTLY text-free background prompt."""
     matches = _EXACT_TEXT_RE.findall(image_prompt)
-    elements = {"headline": matches[0] if matches else "", "labels": matches[1:]}
+    elements = _sanitize_elements({"headline": matches[0] if matches else "", "labels": matches[1:]})
     clean = _CLEAN_TEXT_RE.sub("", image_prompt)
-    clean += "\n\nNO TEXT: render only icons/visuals, leave blank spaces for text overlay."
+    clean = _TEXT_TRIGGERS_RE.sub("", clean)
+    clean = re.sub(r"\s{2,}", " ", clean).strip(" ,.")
+    clean = f"{clean}\n\n{_NO_TEXT_SUFFIX}"
     return elements, clean.strip()
 
 
 def _load_font(size: int):
-    """Load a truetype font or fallback to default."""
-    for path in ["C:/Windows/Fonts/arialbd.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]:
+    """Load a bold truetype font. Same file on Windows and ubuntu-latest runner."""
+    candidates = [
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    for path in candidates:
         try:
             return ImageFont.truetype(path, size)
         except (OSError, IOError):
@@ -488,41 +589,168 @@ def _load_font(size: int):
     return ImageFont.load_default()
 
 
-def _draw_outlined_text(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, font) -> None:
-    for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
-        draw.text((x + dx, y + dy), text, font=font, fill="black")
-    draw.text((x, y), text, font=font, fill="white")
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+    """Wrap text into lines that fit max_width pixels."""
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        trial = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
-def _draw_headline(draw: ImageDraw.ImageDraw, w: int, h: int, headline: str, font) -> None:
+def _fit_font(draw: ImageDraw.ImageDraw, text: str, start_size: int, max_width: int,
+              min_size: int = 18) -> object:
+    """Shrink font until the longest word fits max_width."""
+    size = start_size
+    while size > min_size:
+        font = _load_font(size)
+        words = text.split() or [""]
+        widest = max(draw.textbbox((0, 0), wd, font=font)[2] for wd in words)
+        if widest <= max_width:
+            return font
+        size -= 2
+    return _load_font(min_size)
+
+
+# Accent strip colors per card - corporate comparison feel, deterministic order.
+# 6 entries so 6-item templates (comic/billboard/checklist/roadmap) each get a unique color.
+_CARD_ACCENTS = [(20, 184, 166), (249, 115, 22), (59, 130, 246),
+                 (34, 197, 94), (168, 85, 247), (236, 72, 153)]
+
+_DARK_BANNER = (15, 23, 42, 255)
+_CARD_FILL = (255, 251, 235, 255)
+_CARD_SHADOW = (15, 23, 42, 255)
+_HEADLINE_TEXT = (255, 255, 255, 255)
+_LABEL_TEXT = (17, 24, 39, 255)
+
+
+def _draw_headline_banner(img: Image.Image, draw: ImageDraw.ImageDraw,
+                          w: int, h: int, headline: str) -> int:
+    """Draw opaque top banner + wrapped headline. Returns banner bottom y.
+
+    Opaque banner (not floating outline text) guarantees legibility on any
+    diffusion background and covers any garbled baked text underneath.
+    """
     text = headline.upper()
-    bbox = draw.textbbox((0, 0), text, font=font)
-    x = (w - (bbox[2] - bbox[0])) // 2
-    y = int(h * 0.06)
-    _draw_outlined_text(draw, x, y, text, font)
+    margin = int(w * 0.05)
+    max_text_w = w - 2 * margin - 40
+    font = _fit_font(draw, text, max(30, int(w * 0.062)), max_text_w)
+    lines = _wrap_text(draw, text, font, max_text_w)[:2]
+    line_heights = [draw.textbbox((0, 0), ln, font=font)[3] for ln in lines]
+    text_h = sum(line_heights) + (10 * (len(lines) - 1) if len(lines) > 1 else 0)
+    banner_h = text_h + int(h * 0.055)
+    banner_h = max(banner_h, int(h * 0.13))
 
+    # Banner background + thin accent line at its base.
+    draw.rounded_rectangle([(0, 0), (w, banner_h)], radius=0, fill=_DARK_BANNER)
+    draw.rectangle([(0, banner_h - 6), (w, banner_h)], fill=(20, 184, 166, 255))
 
-def _draw_labels(draw: ImageDraw.ImageDraw, w: int, h: int, labels: list[str], font) -> None:
-    small_font = _load_font(max(16, int(w * 0.03)))
-    # fallback to main font if default was returned and small font failed (already handled)
-    count = len(labels)
-    for i, label in enumerate(labels[:6]):
-        bbox = draw.textbbox((0, 0), label, font=small_font)
+    y = (banner_h - text_h) // 2
+    for ln in lines:
+        bbox = draw.textbbox((0, 0), ln, font=font)
         x = (w - (bbox[2] - bbox[0])) // 2
-        y = int(h * (0.4 + 0.4 * i / max(count, 1)))
-        _draw_outlined_text(draw, x, y, label, small_font)
+        draw.text((x, y), ln, font=font, fill=_HEADLINE_TEXT,
+                  stroke_width=1, stroke_fill=(0, 0, 0, 200))
+        y += (bbox[3] - bbox[1]) + 10
+    return banner_h
+
+
+def _draw_label_grid(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int,
+                     labels: list[str], top: int) -> None:
+    """Draw labels as opaque cards in an aligned grid below `top`.
+
+    Each card is drawn by us (box + text together), so text can never drift
+    off its card - the misalignment in the old center-stack code is impossible.
+    Layout adapts to every template style:
+      1 card -> centered, 2 -> 1 row, 3-4 -> 2x2 grid,
+      5-6 -> 2 cols x 3 rows (comic / billboard / checklist / roadmap / timeline).
+    """
+    n = len(labels)
+    if n == 0:
+        return
+    gap = int(w * 0.035)
+    side = int(w * 0.06)
+
+    if n == 1:
+        boxes = [(side, None, w - side, None)]
+    elif n == 2:
+        card_w = (w - 2 * side - gap) // 2
+        boxes = [(side, None, side + card_w, None),
+                 (side + card_w + gap, None, w - side, None)]
+    else:
+        import math
+        rows_needed = math.ceil(n / 2)
+        card_w = (w - 2 * side - gap) // 2
+        boxes = []
+        for r in range(rows_needed):
+            boxes.append((side, r, side + card_w, r))
+            if len(boxes) < n:
+                boxes.append((side + card_w + gap, r, w - side, r))
+        rows = rows_needed
+    if n <= 2:
+        rows = 1
+    avail_h = h - top - int(h * 0.04)
+    card_h = min(int(h * 0.20), (avail_h - gap * (rows - 1)) // rows)
+    # Vertically center the whole grid in the remaining space.
+    grid_h = rows * card_h + (rows - 1) * gap
+    start_y = top + max(int(h * 0.03), (avail_h - grid_h) // 2)
+
+    # Smaller text when 5-6 cards share the space (billboard/checklist/roadmap styles).
+    base_font_size = max(20, int(w * 0.032)) if n <= 4 else max(16, int(w * 0.026))
+    for idx, (label, box) in enumerate(zip(labels, boxes)):
+        x0, _, x1, _ = box
+        row = box[1] if n > 2 else 0
+        y0 = start_y + row * (card_h + gap)
+        y1 = y0 + card_h
+
+        # Solid offset shadow (neo-brutalist) then card.
+        # Solid fill (not alpha) because RGBA->RGB conversion turns
+        # semi-transparent black into harsh pure-black edges.
+        draw.rounded_rectangle([(x0 + 4, y0 + 4), (x1 + 4, y1 + 4)],
+                               radius=26, fill=_CARD_SHADOW)
+        draw.rounded_rectangle([(x0, y0), (x1, y1)], radius=26, fill=_CARD_FILL,
+                               outline=_CARD_SHADOW, width=3)
+        # Accent strip inset inside the card so corners never poke out.
+        accent = _CARD_ACCENTS[idx % len(_CARD_ACCENTS)]
+        draw.rectangle([(x0 + 2, y0 + 2), (x1 - 2, y0 + 12)], fill=accent + (255,))
+
+        max_text_w = (x1 - x0) - 36
+        font = _fit_font(draw, label, base_font_size, max_text_w, min_size=16)
+        lines = _wrap_text(draw, label.upper(), font, max_text_w)[:2]
+        lh = [draw.textbbox((0, 0), ln, font=font)[3] for ln in lines]
+        block_h = sum(lh) + 8 * (len(lines) - 1)
+        ty = y0 + (card_h - block_h) // 2 + 6  # +6 to clear accent strip
+        for ln in lines:
+            bbox = draw.textbbox((0, 0), ln, font=font)
+            tx = x0 + ((x1 - x0) - (bbox[2] - bbox[0])) // 2
+            draw.text((tx, ty), ln, font=font, fill=_LABEL_TEXT)
+            ty += (bbox[3] - bbox[1]) + 8
 
 
 def _overlay_text(image_bytes: bytes, elements: dict) -> bytes:
-    """Overlay headline and labels onto image using PIL."""
+    """Overlay headline banner + label cards onto image using PIL.
+
+    Keeps your creative text, but draws box+text together in fixed grid
+    positions instead of floating outline text at image center.
+    """
+    elements = _sanitize_elements(elements)
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     draw = ImageDraw.Draw(img)
     w, h = img.size
-    font = _load_font(max(28, int(w * 0.055)))
+    top = 0
     if elements["headline"]:
-        _draw_headline(draw, w, h, elements["headline"], font)
+        top = _draw_headline_banner(img, draw, w, h, elements["headline"])
     if elements["labels"]:
-        _draw_labels(draw, w, h, elements["labels"], font)
+        _draw_label_grid(img, draw, w, h, elements["labels"], top)
     out = io.BytesIO()
     img.convert("RGB").save(out, format="PNG")
     return out.getvalue()
@@ -541,19 +769,32 @@ def _try_apply_overlay(image_bytes: bytes, content_type: str, ext: str, elements
 
 def _ensure_png_output(image_bytes: bytes, content_type: str, ext: str) -> tuple[bytes, str, str]:
     if "png" in content_type:
-        return image_bytes, content_type, ext
+        return image_bytes, content_type, "png"  # force ext to match bytes (was "jpg")
     new_bytes, new_ctype = _normalize_to_png(image_bytes, content_type)
     return new_bytes, new_ctype, "png"
 
 
 def _create_placeholder_image() -> bytes:
-    """Create a neutral 1024x1024 placeholder when all Cloudflare attempts fail."""
-    img = Image.new("RGB", (1024, 1024), color=(245, 245, 240))
+    """Create a clean textured 1024x1024 background when diffusion fails.
+
+    Deliberately text-free with empty top/bottom space - the PIL banner +
+    cards drawn on top still make it look like a finished infographic.
+    """
+    size = 1024
+    top_color = (240, 253, 250)
+    bottom_color = (255, 251, 235)
+    img = Image.new("RGB", (size, size), color=top_color)
     draw = ImageDraw.Draw(img)
-    # subtle grid to keep infographic feel even without model
-    for i in range(0, 1024, 128):
-        draw.line([(i, 0), (i, 1024)], fill=(230, 230, 225), width=1)
-        draw.line([(0, i), (1024, i)], fill=(230, 230, 225), width=1)
+    for y in range(size):
+        t = y / size
+        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * t)
+        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * t)
+        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * t)
+        draw.line([(0, y), (size, y)], fill=(r, g, b))
+    # faint circuit-like grid for tech feel, kept low-contrast so text pops
+    for i in range(0, size, 64):
+        draw.line([(i, 0), (i, size)], fill=(203, 213, 225, 255), width=1)
+        draw.line([(0, i), (size, i)], fill=(203, 213, 225, 255), width=1)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -577,6 +818,11 @@ def generate_image(state: PipelineState) -> PipelineState:
         errors.append("CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY missing from .env")
         raise RuntimeError(f"Image generation failed: {'; '.join(errors)}")
     elements, clean_prompt = _extract_text_and_clean_prompt(full_prompt)
+    if not elements["headline"] and not elements["labels"]:
+        # Last resort: never ship 0-overlay (pure diffusion text). Derive from post.
+        elements = _fallback_elements(state.get("post_text", ""), state.get("topic", ""))
+        print(f"[image] Gemini gave 0 text fragments, fallback overlay: "
+              f"\"{elements['headline']}\" + {len(elements['labels'])} labels")
     print(f"[image] Cloudflare Workers AI | prompt: {clean_prompt[:200]}...")
     print(f"[image] overlay: \"{elements['headline']}\" + {len(elements['labels'])} labels")
     image_bytes, ext = _create_cloudflare_image(clean_prompt, elements, errors)
