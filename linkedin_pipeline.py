@@ -16,37 +16,34 @@ Credentials: loaded from a .env file (python-dotenv)
 import os
 import json
 import io
-import re
 import time
 import random
 import secrets
-import unicodedata
 import warnings
 
-# Suppress LangGraph/LangChain deprecation warnings
-warnings.simplefilter("ignore")
+# Suppress noisy LangGraph/LangChain pending-deprecation warnings before importing LangGraph.
+warnings.filterwarnings("ignore", message=r".*allowed_objects.*", category=Warning)
+warnings.filterwarnings("ignore", category=Warning, module=r"langgraph\.checkpoint\.base.*")
+_showwarning = warnings.showwarning
 
-# Import and suppress the specific LangChain warning class
-try:
-    from langchain._api import LangChainPendingDeprecationWarning
-    warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
-except ImportError:
-    try:
-        from langchain_core._api import LangChainPendingDeprecationWarning
-        warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
-    except ImportError:
-        pass
+
+def _hide_langchain_allowed_objects_warning(message, category, filename, lineno, file=None, line=None):
+    if category.__name__ == "LangChainPendingDeprecationWarning" and "allowed_objects" in str(message):
+        return
+    _showwarning(message, category, filename, lineno, file, line)
+
+
+warnings.showwarning = _hide_langchain_allowed_objects_warning
 
 import requests
 import feedparser
-import chromadb
 from typing import TypedDict
 from dotenv import load_dotenv
-from langgraph.graph import StateGraph, END
-from PIL import Image, ImageDraw, ImageFont
-
-# Re-enable warnings after imports
-warnings.simplefilter("default")
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    import chromadb
+    from langgraph.graph import StateGraph, END
+from PIL import Image
 
 # All text prompts, topic domains and infographic style presets live in post_prompts.py
 from post_prompts import (
@@ -55,6 +52,7 @@ from post_prompts import (
     content_prompt,
     critique_prompt,
     revise_prompt,
+    VISUAL_DIRECTIONS,
     image_prompt_gen,
     image_qa_prompt,
 )
@@ -86,15 +84,6 @@ MODEL_MAX_RETRIES = 2                          # retries per model before switch
 API_BACKOFF_BASE = 2                           # base seconds for exponential backoff (2, 4, 8, 16…)
 API_BACKOFF_MAX = 60                           # cap backoff wait at this many seconds
 API_PACE_DELAY = 5.0                           # min seconds between consecutive successful API calls
-
-# ---- Shared constants (Sonar S1192) ----
-IMAGE_PNG_MIME = "image/png"
-
-# Pre-compiled, linear regexes for image-prompt text extraction (Sonar S6397/S8786).
-# NOTE: alternation is longest-first ("exact text" before "text").
-_TEXT_KEY = r"(?:exact text|header|title|bubble|label|item|text)"
-_EXACT_TEXT_RE = re.compile(_TEXT_KEY + r"(?: \d+)?: \"([^\"]+)\"", flags=re.IGNORECASE)
-_CLEAN_TEXT_RE = re.compile(" ?" + _TEXT_KEY + r"(?: \d+)?: \"[^\"]*\"", flags=re.IGNORECASE)
 
 if not GEMINI_API_KEY or not LINKEDIN_TOKEN:
     raise ValueError("Set GEMINI_API_KEY and LINKEDIN_TOKEN in your .env file (see .env.example)")
@@ -148,103 +137,153 @@ class PipelineState(TypedDict):
     revision_count: int
 
 
-def _build_gemini_body(prompt: str, image_bytes: bytes | None) -> dict:
-    """Build Gemini request body."""
-    import base64
-    body: dict = {"contents": [{"parts": [{"text": prompt}]}]}
-    if image_bytes is None:
-        return body
-    body["contents"][0]["parts"].append(
-        {"inline_data": {"mime_type": IMAGE_PNG_MIME, "data": base64.b64encode(image_bytes).decode()}}
+def _gemini_backoff_wait(resp, attempt: int) -> float:
+    """Calculate how long to wait before retrying a failed Gemini API call.
+
+    Honors the ``Retry-After`` header when present; otherwise falls back
+    to exponential backoff with jitter (``base * 2^(attempt-1)`` +/- 1s),
+    capped at ``API_BACKOFF_MAX``.
+    """
+    if resp is not None:
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                pass  # malformed header -> fall back to exponential backoff
+    wait = min(API_BACKOFF_MAX, API_BACKOFF_BASE * (2 ** (attempt - 1)))
+    return wait + random.uniform(0, 1)  # jitter
+
+
+def _gemini_url(model: str) -> str:
+    return (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={GEMINI_API_KEY}"
     )
-    body["generationConfig"] = {"temperature": 0.0}
-    return body
 
 
-def _is_retryable_status(status: int) -> bool:
-    return status == 429 or status >= 500
+def call_gemini(prompt: str) -> str:
+    """Call Gemini for text generation with multi-model quota fallback.
 
-
-def _backoff_delay(attempt: int) -> float:
-    return min(API_BACKOFF_MAX, API_BACKOFF_BASE * (2 ** (attempt - 1))) + random.uniform(0, 1)
-
-
-def _call_single_model(model: str, body: dict, image_bytes: bytes | None) -> str | None:
-    """Try one model with retries. Returns text on success, None on quota/network failure."""
-    for attempt in range(1, MODEL_MAX_RETRIES + 1):
-        try:
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={GEMINI_API_KEY}"
-            )
-            resp = requests.post(url, json=body, timeout=90 if image_bytes else 60)
-            if _is_retryable_status(resp.status_code):
-                if attempt < MODEL_MAX_RETRIES:
-                    wait = _backoff_delay(attempt)
-                    print(f"[gemini] {model} HTTP {resp.status_code}, backing off {wait:.1f}s")
-                    time.sleep(wait)
-                    continue
-                print(f"[gemini] {model} quota exhausted - switching model")
-                return None
-            resp.raise_for_status()
-            result = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            time.sleep(API_PACE_DELAY)
-            return result
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-            wait = _backoff_delay(attempt)
-            print(f"[gemini] {model} network error ({type(exc).__name__}), backing off {wait:.1f}s")
-            time.sleep(wait)
-    return None
-
-
-def call_gemini(prompt: str, image_bytes: bytes = None) -> str:
-    """Call Gemini for text or vision generation with multi-model quota fallback."""
-    body = _build_gemini_body(prompt, image_bytes)
+    Tries each model in GEMINI_MODELS in order. Within a model, 429/5xx are
+    retried with backoff; if a model's quota is exhausted (429 persists or a
+    per-day quota error), it moves on to the next model instead of dying.
+    """
+    body = {"contents": [{"parts": [{"text": prompt}]}]}
+    last_exc = None
     for model in GEMINI_MODELS:
-        result = _call_single_model(model, body, image_bytes)
-        if result is not None:
-            return result
-    raise RuntimeError("Gemini API failed on all models")
+        for attempt in range(1, MODEL_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(_gemini_url(model), json=body, timeout=60)
+                status = resp.status_code
+
+                # --- Rate-limited (429) or transient server errors (5xx) ---
+                if status == 429 or status >= 500:
+                    print(f"[gemini] {model} HTTP {status} body: {resp.text[:200]}")
+                    if attempt < MODEL_MAX_RETRIES:
+                        wait = _gemini_backoff_wait(resp, attempt)
+                        print(f"[gemini] backing off {wait:.1f}s (attempt {attempt}/{MODEL_MAX_RETRIES})")
+                        time.sleep(wait)
+                        continue
+                    print(f"[gemini] {model} quota exhausted - switching model")
+                    break  # move to next model
+
+                # --- Non-retryable client errors (400, 401, 403) -> fail fast ---
+                resp.raise_for_status()
+                result = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                time.sleep(API_PACE_DELAY)  # stay under free-tier RPM
+                return result
+
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as exc:
+                last_exc = exc
+                if attempt < MODEL_MAX_RETRIES:
+                    wait = _gemini_backoff_wait(None, attempt)
+                    print(f"[gemini] {model} network error ({type(exc).__name__}), "
+                          f"backing off {wait:.1f}s (attempt {attempt}/{MODEL_MAX_RETRIES})")
+                    time.sleep(wait)
+                else:
+                    print(f"[gemini] {model} network error ({type(exc).__name__}) on last "
+                          f"attempt - switching model")
+
+    raise RuntimeError(
+        "Gemini API failed on all models (GEMINI_MODELS) - see printed "
+        "response bodies above for the exact quota that was hit"
+    ) from last_exc
 
 
-def _parse_qa_issues(reply: str) -> str:
-    """Extract ISSUES line from QA reply."""
-    for line in reply.splitlines():
-        stripped = line.strip()
-        if stripped.upper().startswith("ISSUES:"):
-            issues = stripped.split(":", 1)[1].strip()
-            return "" if issues.lower() == "none" else issues
-    return ""
+def call_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str) -> str:
+    """Send an image + text prompt to Gemini and return the text reply.
+
+    Used for the image spelling/legibility QA check. Same multi-model
+    quota fallback as call_gemini(); on total failure reports an unparseable
+    BAD verdict so check_image_spelling stays fail-closed.
+    """
+    import base64
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0},
+    }
+    for model in GEMINI_MODELS:
+        for attempt in range(1, MODEL_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(_gemini_url(model), json=body, timeout=90)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    if attempt < MODEL_MAX_RETRIES:
+                        time.sleep(_gemini_backoff_wait(resp, attempt))
+                        continue
+                    break  # next model
+                resp.raise_for_status()
+                return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout):
+                time.sleep(_gemini_backoff_wait(None, attempt))
+    # Fail-closed: if the vision API is unreachable we cannot verify the text.
+    return "VERDICT: BAD - vision QA unavailable (Gemini API failed on all models)"
 
 
-def check_image_spelling(image_bytes: bytes) -> tuple[bool, str]:
-    """Returns (ok, issues). ok=True means visible text is spelled correctly."""
+def check_image_spelling(image_bytes: bytes, mime_type: str, post_context: str = "") -> tuple[bool, str]:
+    """Returns (ok, issues). ok=True means visible text is spelled, readable, and grammatical."""
     try:
-        reply = call_gemini(image_qa_prompt(), image_bytes)
-    except Exception as exc:
-        return False, f"vision QA unavailable: {exc}"
+        reply = call_gemini_vision(image_bytes, mime_type, image_qa_prompt(post_context))
+    except Exception as e:
+        # Fail-closed: an unverifiable image must not be accepted as clean.
+        print(f"[image-qa] vision check failed ({e}) - treating as BAD")
+        return False, f"vision QA unavailable: {e}"
     upper = reply.upper()
+    # Fail-closed: accept ONLY an explicit VERDICT: OK. A missing, garbled or
+    # unexpected verdict is treated as BAD so the image gets re-rendered.
     ok = "VERDICT: OK" in upper and "VERDICT: BAD" not in upper
-    return ok, _parse_qa_issues(reply)
+    issues = ""
+    for line in reply.splitlines():
+        stripped = line.strip().upper()
+        if stripped.startswith("ISSUES:"):
+            issues = line.split(":", 1)[1].strip()
+            if issues.lower() == "none":
+                issues = ""
+        elif stripped.startswith("TEXTS:") and not issues:
+            # fall back to the transcription when ISSUES: is missing/empty
+            transcription = line.split(":", 1)[1].strip()
+            if transcription and transcription.lower() != "none":
+                issues = f"check these fragments: {transcription}"
+    return ok, issues
 
-
-
-def _fetch_feed_titles(feed_url: str) -> list[str]:
-    """Fetch one RSS feed with timeout, return up to 5 titles."""
-    try:
-        resp = requests.get(feed_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        resp.raise_for_status()
-        feed = feedparser.parse(resp.content)
-        return [entry.title for entry in feed.entries[:5]]
-    except Exception:
-        return []
 
 
 def get_topic_pool() -> list[str]:
     """Combine live headlines from ALL domain RSS feeds with the evergreen lists into one pool"""
-    pool = list(ALL_EVERGREEN_TOPICS)
+    pool = list(ALL_EVERGREEN_TOPICS)  # static fallback is always included
     for feed_url in ALL_RSS_FEEDS:
-        pool.extend(_fetch_feed_titles(feed_url))
+        try:
+            feed = feedparser.parse(feed_url, request_headers={"User-Agent": "Mozilla/5.0"})
+            pool.extend(entry.title for entry in feed.entries[:5])
+        except Exception:
+            continue  # if one feed fails, try the others; don't break the whole pipeline
     return pool
 
 
@@ -276,7 +315,9 @@ CLICHES = [
     "in the realm of", "tapestry", "navigate the landscape", "supercharge",
 ]
 
-def _parse_critique_response(raw: str) -> tuple[int, str]:
+def critique_post(state: PipelineState) -> PipelineState:
+    text = state["post_text"]
+    raw = call_gemini(critique_prompt(text))
     score, feedback = 5, ""
     in_feedback = False
     for line in raw.splitlines():
@@ -288,43 +329,29 @@ def _parse_critique_response(raw: str) -> tuple[int, str]:
             in_feedback = False
         elif upper.startswith("FEEDBACK:"):
             feedback = stripped.split(":", 1)[1].strip()
-            in_feedback = True
+            in_feedback = True  # feedback may continue on following lines - keep it all
         elif in_feedback and stripped:
             feedback += " " + stripped
-    return score, feedback
 
+    # Deterministic penalty: known AI cliches instantly cap the score below the revision gate
+    lower = text.lower()
+    hits = [c for c in CLICHES if c in lower]
+    if hits:
+        score = min(score, 5)
+        feedback = f"Remove these overused AI phrases: {', '.join(hits)}. " + (feedback or "")
+    # Deterministic penalty: missing final hashtag line means the format contract was broken
+    if not any(word.startswith("#") for word in text.split()[-8:]):
+        score = min(score, 5)
+        feedback = "The mandatory final hashtag line is missing. " + (feedback or "")
+    # Deterministic penalty: too few emojis -> flat caption. Count via the unicode emoji range.
+    emoji_count = sum(1 for ch in text if ord(ch) > 0x2190)
+    if emoji_count < 4:
+        score = min(score, 6)
+        feedback = (
+            f"Only {emoji_count} emojis found - add 5-7 expressive ones (one per paragraph) "
+            "to give the post energy. " + (feedback or "")
+        )
 
-def _apply_cliche_penalty(text: str, score: int, feedback: str) -> tuple[int, str]:
-    hits = [c for c in CLICHES if c in text.lower()]
-    if not hits:
-        return score, feedback
-    return min(score, 5), f"Remove these overused AI phrases: {', '.join(hits)}. " + (feedback or "")
-
-
-def _apply_hashtag_penalty(text: str, score: int, feedback: str) -> tuple[int, str]:
-    if any(word.startswith("#") for word in text.split()[-8:]):
-        return score, feedback
-    return min(score, 5), "The mandatory final hashtag line is missing. " + (feedback or "")
-
-
-def _apply_emoji_penalty(text: str, score: int, feedback: str) -> tuple[int, str]:
-    emoji_count = sum(1 for ch in text if unicodedata.category(ch) == "So")
-    if emoji_count >= 4:
-        return score, feedback
-    msg = (
-        f"Only {emoji_count} emojis found - add 5-7 expressive ones (one per paragraph) "
-        "to give the post energy. " + (feedback or "")
-    )
-    return min(score, 6), msg
-
-
-def critique_post(state: PipelineState) -> PipelineState:
-    text = state["post_text"]
-    raw = call_gemini(critique_prompt(text))
-    score, feedback = _parse_critique_response(raw)
-    score, feedback = _apply_cliche_penalty(text, score, feedback)
-    score, feedback = _apply_hashtag_penalty(text, score, feedback)
-    score, feedback = _apply_emoji_penalty(text, score, feedback)
     state["critique_score"] = score
     state["critique_feedback"] = feedback.strip()
     print(f"[critic] score={score}/10 | feedback={state['critique_feedback'][:120]}")
@@ -350,73 +377,18 @@ def revise_content(state: PipelineState) -> PipelineState:
     return state
 
 
-# ---- Node 3: Generate image prompt (agent-driven, 15 templates) ----
-def _has_overlay_text(image_prompt: str) -> bool:
-    """True if Gemini obeyed the format and emitted at least one exact text fragment."""
-    return bool(_EXACT_TEXT_RE.search(image_prompt or ""))
-
-
-def _label_ok(cand: str, seen: set[str]) -> bool:
-    """Check one fallback candidate is short, clean and unseen."""
-    words = cand.split()
-    if len(words) < 2 or len(words) > 4 or len(cand) > 32:
-        return False
-    if cand.lower() in seen:
-        return False
-    if any(c in cand for c in ["http", "://", "&", "|", "[", "]", "(", ")"]):
-        return False
-    return bool(re.search(r"[A-Za-z]", cand))
-
-
-def _split_chunks(chunk: str) -> list[str]:
-    """Short lines as-is; long sentences split on commas/conjunctions."""
-    if len(chunk.split()) <= 5:
-        return [chunk]
-    return re.split(r",|;|:| and | or | with | to | instead of ", chunk, flags=re.IGNORECASE)
-
-
-def _fallback_elements(post_text: str, topic: str) -> dict:
-    """Build overlay text from the post itself when Gemini forgets exact text fragments.
-
-    Guarantees the image never ships with 0 overlay labels (the roadmap run that
-    posted pure diffusion-baked text). Headline = topic, labels = first short
-    phrases from the post body.
-    """
-    headline = (topic or "").strip().strip("\"'")[:42]
-    labels: list[str] = []
-    seen: set[str] = set()
-    for line in (post_text or "").splitlines():
-        chunk = re.sub(r"[#@*_`>~\-–—\d.)(\[\]]+", " ", line).strip()
-        chunk = re.sub(r"\s+", " ", chunk).strip()
-        if not chunk:
-            continue
-        # The Python-scripts post had only long lines -> 0 labels before.
-        for part in _split_chunks(chunk):
-            cand = re.sub(r"\s+", " ", part.strip().strip(",;.")).strip()
-            if _label_ok(cand, seen):
-                seen.add(cand.lower())
-                labels.append(cand)
-            if len(labels) >= 6:
-                break
-        if len(labels) >= 6:
-            break
-    if not headline and labels:
-        headline, labels = labels[0], labels[1:]
-    return _sanitize_elements({"headline": headline, "labels": labels})
-
-
+# ---- Node 3: Generate image prompt (agent-driven, 7 templates) ----
 def generate_image_prompt(state: PipelineState) -> PipelineState:
-    prompt = call_gemini(image_prompt_gen(state["post_text"]))
-    if not _has_overlay_text(prompt):
-        # Gemini echoed "TEMPLATE B - ROADMAP: ..." instead of the final prompt
-        # (seen in live run) -> one retry forces the exact-text format.
-        print("[image-prompt] no exact text fragments found, retrying once for format...")
-        prompt = call_gemini(
-            image_prompt_gen(state["post_text"])
-            + "\n\nSTRICT: start directly with the visual description. "
-            'Never write TEMPLATE, never explain. Emit at least 2 fragments as exact text: "Words".'
-        )
-    state["image_prompt"] = prompt
+    visual_index = (
+        collection.count()
+        + len(state.get("tried_topics", []))
+        + state.get("retry_count", 0)
+    ) % len(VISUAL_DIRECTIONS)
+    visual_direction = VISUAL_DIRECTIONS[visual_index]
+    state["image_prompt"] = call_gemini(
+        image_prompt_gen(state["post_text"], state["topic"], visual_direction)
+    )
+    print(f"[image-style] {visual_direction}")
     print(f"[image-prompt] {state['image_prompt'][:160]}...")
     return state
 
@@ -441,425 +413,235 @@ def route_after_uniqueness(state: PipelineState) -> str:
     return "pick_topic"
 
 
-# ---- Image generation via Cloudflare Workers AI ----
-JPEG_MIME = "image/jpeg"
-IMAGE_QA_MAX_ATTEMPTS = 3
+# ---- Image generation via Cloudflare Workers AI (REST endpoint) ----
+JPEG_MIME = "image/jpeg"  # default MIME for all Workers AI image responses (SonarQube S1192)
+CF_FLUX2_KLEIN = "@cf/black-forest-labs/flux-2-klein-4b"  # ultra-fast distilled FLUX.2 (default)
+CF_FLUX2_DEV = "@cf/black-forest-labs/flux-2-dev"          # higher quality, slower fallback
+CF_FLUX1_SCHNELL = "@cf/black-forest-labs/flux-1-schnell"  # fast fallback
+CF_SDXL_MODEL = "@cf/stabilityai/stable-diffusion-xl-base-1.0"  # last resort
 
+# Per-model generation params + per-call timeout.
+# IMPORTANT: flux-2-dev is NOT step-distilled like klein-4b/schnell (those are
+# purpose-trained to look good in just 4-8 steps). Running dev at klein's 8
+# steps under-cooks it - that's the main reason even the "best" model still
+# produced garbled text in QA logs. Dev needs ~25-30 steps for clean typography.
 CF_MODELS = {
-    "@cf/black-forest-labs/flux-2-klein-4b": {"steps": 8, "width": 1024, "height": 1024, "guidance": 3.5},
-    "@cf/black-forest-labs/flux-2-dev": {"steps": 8, "width": 1024, "height": 1024, "guidance": 3.5},
-    "@cf/black-forest-labs/flux-1-schnell": {"steps": 8},
-    "@cf/stabilityai/stable-diffusion-xl-base-1.0": {},
+    CF_FLUX2_KLEIN: {"steps": 8, "width": 1024, "height": 768, "guidance": 3.5, "timeout": 180},
+    CF_FLUX2_DEV: {"steps": 28, "width": 1024, "height": 768, "guidance": 5.0, "timeout": 240},
+    CF_FLUX1_SCHNELL: {"steps": 8, "timeout": 180},
+    CF_SDXL_MODEL: {"timeout": 180},
 }
 
 
 def _run_cf_model(model: str, prompt: str) -> tuple[bytes, str]:
-    """Call one Cloudflare Workers AI image model."""
+    """Call one Cloudflare Workers AI image model; returns (image_bytes, content_type).
+
+    Params (steps/width/height/guidance/timeout) come from CF_MODELS per model.
+    Raises RuntimeError with the API error message on any non-200 response.
+    """
     import base64
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{model}"
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}"
+        f"/ai/run/{model}"
+    )
     params = CF_MODELS.get(model, {})
-    is_flux2 = "flux-2" in model
-
-    if is_flux2:
-        resp = requests.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_KEY}"},
-                             files={"prompt": (None, prompt), **{k: (None, str(v)) for k, v in params.items()}})
+    timeout = params.get("timeout", 180)
+    if model in (CF_FLUX2_KLEIN, CF_FLUX2_DEV):
+        # FLUX.2 models require multipart/form-data and return JSON {result: {image: base64}}
+        files = {"prompt": (None, prompt)}
+        for key in ("steps", "width", "height", "guidance"):
+            if key in params:
+                files[key] = (None, str(params[key]))
+        files["seed"] = (None, str(secrets.randbelow(2_147_483_647)))  # crypto-safe seed (SonarQube S2245)
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {CLOUDFLARE_API_KEY}"},
+            files=files,
+            timeout=timeout,
+        )
+    elif model == CF_FLUX1_SCHNELL:
+        # flux-1-schnell's JSON schema only accepts prompt + steps; returns raw image bytes
+        body = {"prompt": prompt}
+        if "steps" in params:
+            body["steps"] = params["steps"]
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=timeout,
+        )
     else:
-        resp = requests.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
-                                           "Content-Type": "application/json"},
-                             json={"prompt": prompt, **params})
-
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {CLOUDFLARE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"prompt": prompt},
+            timeout=timeout,
+        )
     if resp.status_code != 200:
-        raise RuntimeError(f"Cloudflare {model} error {resp.status_code}: {resp.text[:300]}")
-
+        try:
+            detail = resp.json().get("errors", resp.text[:300])
+        except Exception:
+            detail = resp.text[:300]
+        raise RuntimeError(f"Cloudflare {model} error {resp.status_code}: {detail}")
     content_type = resp.headers.get("Content-Type", JPEG_MIME)
     if "image" in content_type:
         return resp.content, content_type
-    b64 = (resp.json().get("result") or {}).get("image")
-    if b64:
-        return base64.b64decode(b64), JPEG_MIME
-    raise RuntimeError(f"Cloudflare {model} returned non-image: {content_type}")
-
-
-def _normalize_to_png(img: bytes, ctype: str) -> tuple[bytes, str]:
-    """Ensure image bytes are PNG."""
-    if "png" in ctype:
-        return img, ctype
-    with Image.open(io.BytesIO(img)) as im:
-        buf = io.BytesIO()
-        im.save(buf, format="PNG")
-        return buf.getvalue(), IMAGE_PNG_MIME
-
-
-def _log_qa_result(attempt: int, model: str, ok: bool, issues: str) -> None:
-    short = model.split("/")[-1] if "/" in model else model
-    status = "OK" if ok else "BAD"
-    suffix = f" - {issues}" if issues else ""
-    print(f"[image-qa] attempt {attempt} [{short}]: {status}{suffix}")
-
-
-def _try_single_model_qa(model: str, prompt: str, attempt: int, errors: list) -> tuple[bytes, str, bool] | None:
-    """Try one model, run QA. Returns (bytes, ctype, is_ok) or None on network error."""
+    # JSON-wrapped result: {"result": {"image": "<base64>"}}
     try:
-        img, ctype = _run_cf_model(model, prompt)
-    except Exception as exc:
-        errors.append(str(exc))
-        print(f"[image] {exc} - trying next model...")
-        return None
-    img, ctype = _normalize_to_png(img, ctype)
-    ok, issues = check_image_spelling(img)
-    _log_qa_result(attempt, model, ok, issues)
-    if not ok:
-        errors.append(f"{model}: {issues}")
-    return img, ctype, ok
+        payload = resp.json()
+        b64 = (payload.get("result") or {}).get("image")
+        if b64:
+            return base64.b64decode(b64), JPEG_MIME
+    except Exception:
+        pass
+    raise RuntimeError(f"Cloudflare {model} returned non-image response: {content_type}")
 
 
-def _generate_image_with_qa(prompt: str, errors: list) -> tuple | None:
-    """Try Cloudflare models with QA check. Returns ONLY a clean (OK) render.
+# ---- Node 6: Generate the image - Cloudflare Workers AI (klein-4b, then dev/schnell/SDXL) ----
+IMAGE_QA_MAX_ATTEMPTS = 3
+TEXT_FREE_IMAGE_ATTEMPTS = 2
 
-    Never ships a BAD render with garbled baked-in text - a garbled background
-    plus a PIL overlay is what produced the double-text mess. If every attempt
-    has baked text, return None so the caller falls back to a clean placeholder
-    + crisp PIL cards instead.
+
+def _generate_via_models(prompt: str, errors: list, attempt: int = 1):
+    """Try Cloudflare models in order; return (bytes, content_type, model_name) or None.
+
+    Attempt 1 uses the cheap-first chain (klein-4b). On QA-failed retries we
+    lead with the BEST text-rendering model (flux-2-dev, now at proper step
+    count) so the re-render has the strongest chance of spelling correctly.
     """
-    models = ("@cf/black-forest-labs/flux-2-klein-4b", "@cf/black-forest-labs/flux-2-dev",
-              "@cf/black-forest-labs/flux-1-schnell", "@cf/stabilityai/stable-diffusion-xl-base-1.0")
-    for attempt in range(1, IMAGE_QA_MAX_ATTEMPTS + 1):
-        for model in models:
-            result = _try_single_model_qa(model, prompt, attempt, errors)
-            if result is None:
-                continue  # network error, try next model
-            img, ctype, is_ok = result
-            if is_ok:
-                return img, ctype
-            # BAD = baked garbled text -> discard, never use as fallback.
-            # Continue to next model (fresh background) instead of breaking.
-    print(f"[image-qa] all {IMAGE_QA_MAX_ATTEMPTS} attempts had baked text - "
-          f"discarding garbled renders, will use clean placeholder + overlay")
+    if attempt >= 2:
+        models = (CF_FLUX2_DEV, CF_FLUX2_KLEIN, CF_FLUX1_SCHNELL, CF_SDXL_MODEL)
+    else:
+        models = (CF_FLUX2_KLEIN, CF_FLUX2_DEV, CF_FLUX1_SCHNELL, CF_SDXL_MODEL)
+    for model in models:
+        try:
+            img_bytes, ctype = _run_cf_model(model, prompt)
+            return img_bytes, ctype, model  # real model that succeeded, not a guess
+        except Exception as e:
+            errors.append(str(e))
+            print(f"[image] {e} - trying next model...")
     return None
 
 
-# Phrases that make diffusion models attempt (and garble) text. Stripped
-# from the background prompt - ALL real text is drawn later via PIL.
-_TEXT_TRIGGERS_RE = re.compile(
-    r"(perfectly legible English|legible English|readable text|speech bubbles?|"
-    r"text bubbles?|with text|caption labels?|word labels?|headers? with words?|"
-    r"bullet lines?|quote text|attribution line|dated labels?|milestone nodes? with[^,]*|"
-    r"exact word[^,]*|short labels?[^,]*|bold (headers?|titles?|labels?)[^,]*|"
-    r"huge (headline|numbers?|quote)[^,]*|number labels?[^,]*),?",
-    flags=re.IGNORECASE,
-)
-
-_NO_TEXT_SUFFIX = (
-    "ABSOLUTELY NO TEXT, no letters, no words, no numbers, no signs, no captions, "
-    "no speech bubbles, no labels anywhere. Pure abstract background illustration only: "
-    "icons, shapes and empty blank cream panels with generous empty space at the top "
-    "for a title banner and empty cards at the bottom for text overlay. Clean, "
-    "uncluttered, blurred background details so overlaid text stays legible."
-)
+def _build_retry_prompt(full_prompt: str, issues: str) -> str:
+    """Re-render after QA failure with fewer, simpler integrated text fragments."""
+    return (
+        f"{full_prompt}\n\nIMPORTANT: previous render had spelling, layout, or "
+        f"caption-match problems ({issues}). Re-render the same hand-drawn LinkedIn "
+        f"explainer concept with AT MOST 4 readable text fragments, each 1-3 simple "
+        f"English words, spelled exactly, no duplicates, no filler letters, no tiny "
+        f"background text. Keep text inside speech bubbles, callouts, or labels that "
+        f"belong to the drawing."
+    )
 
 
-def _sanitize_elements(elements: dict) -> dict:
-    """Clean + dedupe extracted texts so overlay stays legible and creative."""
-    def _clean_one(s: str, max_words: int = 5, max_chars: int = 32) -> str:
-        s = re.sub(r"\s+", " ", (s or "").strip().strip("\"'")).strip()
-        s = s[:max_chars].strip()
-        words = s.split()
-        if len(words) > max_words:
-            s = " ".join(words[:max_words])
-        return s
-
-    headline = _clean_one(elements.get("headline", ""), max_words=6, max_chars=42)
-    seen: set[str] = set()
-    labels: list[str] = []
-    for raw in elements.get("labels", []) or []:
-        lab = _clean_one(raw)
-        if not lab or lab.lower() in seen:
-            continue
-        seen.add(lab.lower())
-        labels.append(lab)
-        if len(labels) >= 6:  # supports all 15 templates: 2x2 grid (3-4) up to 2x3 grid (5-6 for comic/billboard/checklist/roadmap)
-            break
-    return {"headline": headline, "labels": labels}
+def _build_text_free_prompt(full_prompt: str, issues: str = "") -> str:
+    return (
+        f"{full_prompt}\n\nLAST RESORT: previous render had spelling or layout problems "
+        f"({issues}). Ignore any earlier instruction to include quoted or readable text. "
+        f"Render the same topic as a clean hand-drawn LinkedIn explainer "
+        f"with ABSOLUTELY NO text, letters, numbers, words, captions, signs, labels, "
+        f"speech bubbles, logos, or watermark anywhere. Use only characters, objects, "
+        f"arrows, paths, symbols, facial expressions, server racks, tools, documents, "
+        f"checkpoints, warning icons, and visual storytelling to show the idea."
+    )
 
 
-def _extract_text_and_clean_prompt(image_prompt: str) -> tuple[dict, str]:
-    """Extract text elements for PIL overlay and return a STRICTLY text-free background prompt."""
-    matches = _EXACT_TEXT_RE.findall(image_prompt)
-    elements = _sanitize_elements({"headline": matches[0] if matches else "", "labels": matches[1:]})
-    clean = _CLEAN_TEXT_RE.sub("", image_prompt)
-    clean = _TEXT_TRIGGERS_RE.sub("", clean)
-    clean = re.sub(r"\s{2,}", " ", clean).strip(" ,.")
-    clean = f"{clean}\n\n{_NO_TEXT_SUFFIX}"
-    return elements, clean.strip()
-
-
-def _load_font(size: int):
-    """Load a bold truetype font. Same file on Windows and ubuntu-latest runner."""
-    candidates = [
-        "C:/Windows/Fonts/arialbd.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size)
-        except (OSError, IOError):
-            continue
-    return ImageFont.load_default()
-
-
-def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
-    """Wrap text into lines that fit max_width pixels."""
-    words = text.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        trial = f"{current} {word}".strip()
-        bbox = draw.textbbox((0, 0), trial, font=font)
-        if bbox[2] - bbox[0] <= max_width or not current:
-            current = trial
-        else:
-            lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
-    return lines
-
-
-def _fit_font(draw: ImageDraw.ImageDraw, text: str, start_size: int, max_width: int,
-              min_size: int = 18) -> object:
-    """Shrink font until the longest word fits max_width."""
-    size = start_size
-    while size > min_size:
-        font = _load_font(size)
-        words = text.split() or [""]
-        widest = max(draw.textbbox((0, 0), wd, font=font)[2] for wd in words)
-        if widest <= max_width:
-            return font
-        size -= 2
-    return _load_font(min_size)
-
-
-# Accent strip colors per card - corporate comparison feel, deterministic order.
-# 6 entries so 6-item templates (comic/billboard/checklist/roadmap) each get a unique color.
-_CARD_ACCENTS = [(20, 184, 166), (249, 115, 22), (59, 130, 246),
-                 (34, 197, 94), (168, 85, 247), (236, 72, 153)]
-
-_DARK_BANNER = (15, 23, 42, 255)
-_CARD_FILL = (255, 251, 235, 255)
-_CARD_SHADOW = (15, 23, 42, 255)
-_HEADLINE_TEXT = (255, 255, 255, 255)
-_LABEL_TEXT = (17, 24, 39, 255)
-
-
-def _draw_headline_banner(draw: ImageDraw.ImageDraw,
-                          w: int, h: int, headline: str) -> int:
-    """Draw opaque top banner + wrapped headline. Returns banner bottom y.
-
-    Opaque banner (not floating outline text) guarantees legibility on any
-    diffusion background and covers any garbled baked text underneath.
-    """
-    text = headline.upper()
-    margin = int(w * 0.05)
-    max_text_w = w - 2 * margin - 40
-    font = _fit_font(draw, text, max(30, int(w * 0.062)), max_text_w)
-    lines = _wrap_text(draw, text, font, max_text_w)[:2]
-    line_heights = [draw.textbbox((0, 0), ln, font=font)[3] for ln in lines]
-    text_h = sum(line_heights) + (10 * (len(lines) - 1) if len(lines) > 1 else 0)
-    banner_h = text_h + int(h * 0.055)
-    banner_h = max(banner_h, int(h * 0.13))
-
-    # Banner background + thin accent line at its base.
-    draw.rounded_rectangle([(0, 0), (w, banner_h)], radius=0, fill=_DARK_BANNER)
-    draw.rectangle([(0, banner_h - 6), (w, banner_h)], fill=(20, 184, 166, 255))
-
-    y = (banner_h - text_h) // 2
-    for ln in lines:
-        bbox = draw.textbbox((0, 0), ln, font=font)
-        x = (w - (bbox[2] - bbox[0])) // 2
-        draw.text((x, y), ln, font=font, fill=_HEADLINE_TEXT,
-                  stroke_width=1, stroke_fill=(0, 0, 0, 200))
-        y += (bbox[3] - bbox[1]) + 10
-    return banner_h
-
-
-def _grid_boxes(n: int, w: int, gap: int, side: int) -> tuple[list, int]:
-    """Compute card boxes + row count for n labels. Extracted to keep complexity low."""
-    if n == 1:
-        return [(side, 0, w - side, 0)], 1
-    import math
-    card_w = (w - 2 * side - gap) // 2
-    if n == 2:
-        return [(side, 0, side + card_w, 0),
-                (side + card_w + gap, 0, w - side, 0)], 1
-    rows = math.ceil(n / 2)
-    boxes = []
-    for r in range(rows):
-        boxes.append((side, r, side + card_w, r))
-        if len(boxes) < n:
-            boxes.append((side + card_w + gap, r, w - side, r))
-    return boxes, rows
-
-
-def _draw_single_card(draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int,
-                      label: str, idx: int, base_font_size: int) -> None:
-    """Draw one opaque card + centered text. Extracted to keep grid complexity low."""
-    # Solid offset shadow (neo-brutalist) then card.
-    # Solid fill (not alpha) because RGBA->RGB conversion turns
-    # semi-transparent black into harsh pure-black edges.
-    draw.rounded_rectangle([(x0 + 4, y0 + 4), (x1 + 4, y1 + 4)],
-                           radius=26, fill=_CARD_SHADOW)
-    draw.rounded_rectangle([(x0, y0), (x1, y1)], radius=26, fill=_CARD_FILL,
-                           outline=_CARD_SHADOW, width=3)
-    # Accent strip inset inside the card so corners never poke out.
-    accent = _CARD_ACCENTS[idx % len(_CARD_ACCENTS)]
-    draw.rectangle([(x0 + 2, y0 + 2), (x1 - 2, y0 + 12)], fill=accent + (255,))
-
-    card_h = y1 - y0
-    max_text_w = (x1 - x0) - 36
-    font = _fit_font(draw, label, base_font_size, max_text_w, min_size=16)
-    lines = _wrap_text(draw, label.upper(), font, max_text_w)[:2]
-    lh = [draw.textbbox((0, 0), ln, font=font)[3] for ln in lines]
-    block_h = sum(lh) + 8 * (len(lines) - 1)
-    ty = y0 + (card_h - block_h) // 2 + 6  # +6 to clear accent strip
-    for ln in lines:
-        bbox = draw.textbbox((0, 0), ln, font=font)
-        tx = x0 + ((x1 - x0) - (bbox[2] - bbox[0])) // 2
-        draw.text((tx, ty), ln, font=font, fill=_LABEL_TEXT)
-        ty += (bbox[3] - bbox[1]) + 8
-
-
-def _draw_label_grid(draw: ImageDraw.ImageDraw, w: int, h: int,
-                     labels: list[str], top: int) -> None:
-    """Draw labels as opaque cards in an aligned grid below `top`.
-
-    Each card is drawn by us (box + text together), so text can never drift
-    off its card - the misalignment in the old center-stack code is impossible.
-    Layout adapts to every template style:
-      1 card -> centered, 2 -> 1 row, 3-4 -> 2x2 grid,
-      5-6 -> 2 cols x 3 rows (comic / billboard / checklist / roadmap / timeline).
-    """
-    n = len(labels)
-    if n == 0:
-        return
-    gap = int(w * 0.035)
-    side = int(w * 0.06)
-    boxes, rows = _grid_boxes(n, w, gap, side)
-    avail_h = h - top - int(h * 0.04)
-    card_h = min(int(h * 0.20), (avail_h - gap * (rows - 1)) // rows)
-    # Vertically center the whole grid in the remaining space.
-    grid_h = rows * card_h + (rows - 1) * gap
-    start_y = top + max(int(h * 0.03), (avail_h - grid_h) // 2)
-
-    # Smaller text when 5-6 cards share the space (billboard/checklist/roadmap styles).
-    base_font_size = max(20, int(w * 0.032)) if n <= 4 else max(16, int(w * 0.026))
-    for idx, (label, box) in enumerate(zip(labels, boxes)):
-        x0, row, x1, _ = box
-        y0 = start_y + row * (card_h + gap)
-        _draw_single_card(draw, x0, y0, x1, y0 + card_h, label, idx, base_font_size)
-
-
-def _overlay_text(image_bytes: bytes, elements: dict) -> bytes:
-    """Overlay headline banner + label cards onto image using PIL.
-
-    Keeps your creative text, but draws box+text together in fixed grid
-    positions instead of floating outline text at image center.
-    """
-    elements = _sanitize_elements(elements)
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-    draw = ImageDraw.Draw(img)
-    w, h = img.size
-    top = 0
-    if elements["headline"]:
-        top = _draw_headline_banner(draw, w, h, elements["headline"])
-    if elements["labels"]:
-        _draw_label_grid(draw, w, h, elements["labels"], top)
-    out = io.BytesIO()
-    img.convert("RGB").save(out, format="PNG")
-    return out.getvalue()
-
-def _try_apply_overlay(image_bytes: bytes, content_type: str, ext: str, elements: dict) -> tuple[bytes, str, str]:
-    if not (elements["headline"] or elements["labels"]):
-        return image_bytes, content_type, ext
+def _normalize_to_png(image_bytes: bytes, content_type: str) -> tuple[bytes, str]:
+    """Return PNG bytes for cleaner text QA and final upload quality."""
+    if "png" in (content_type or "").lower():
+        return image_bytes, "image/png"
     try:
-        new_bytes = _overlay_text(image_bytes, elements)
-        print("[image] text overlay applied")
-        return new_bytes, IMAGE_PNG_MIME, "png"
-    except Exception as exc:
-        print(f"[image] overlay failed ({exc})")
-        return image_bytes, content_type, ext
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            out = io.BytesIO()
+            img.save(out, format="PNG")
+            return out.getvalue(), "image/png"
+    except Exception:
+        return image_bytes, content_type
 
 
-def _ensure_png_output(image_bytes: bytes, content_type: str, ext: str) -> tuple[bytes, str, str]:
-    if "png" in content_type:
-        return image_bytes, content_type, "png"  # force ext to match bytes (was "jpg")
-    new_bytes, new_ctype = _normalize_to_png(image_bytes, content_type)
-    return new_bytes, new_ctype, "png"
+def _render_best_image(full_prompt: str, errors: list, post_context: str) -> tuple:
+    """Generate + Gemini QA up to IMAGE_QA_MAX_ATTEMPTS.
 
-
-def _create_placeholder_image() -> bytes:
-    """Create a clean textured 1024x1024 background when diffusion fails.
-
-    Deliberately text-free with empty top/bottom space - the PIL banner +
-    cards drawn on top still make it look like a finished infographic.
+    Returns (image_bytes, content_type, qa_passed). qa_passed=False means every
+    single attempt still had visible text problems - the caller must NOT post
+    this blind, since it means garbled/gibberish text would go out live.
     """
-    size = 1024
-    top_color = (240, 253, 250)
-    bottom_color = (255, 251, 235)
-    img = Image.new("RGB", (size, size), color=top_color)
-    draw = ImageDraw.Draw(img)
-    for y in range(size):
-        t = y / size
-        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * t)
-        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * t)
-        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * t)
-        draw.line([(0, y), (size, y)], fill=(r, g, b))
-    # faint circuit-like grid for tech feel, kept low-contrast so text pops
-    for i in range(0, size, 64):
-        draw.line([(i, 0), (i, size)], fill=(203, 213, 225, 255), width=1)
-        draw.line([(0, i), (size, i)], fill=(203, 213, 225, 255), width=1)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    best = None
+    prompt = full_prompt
+    for attempt in range(1, IMAGE_QA_MAX_ATTEMPTS + 1):
+        generated = _generate_via_models(prompt, errors, attempt)
+        if generated is None:
+            break
+        img, ctype, model_used = generated  # real model name, not a guess from attempt number
+        qa_img, qa_ctype = _normalize_to_png(img, ctype)
+        ok, issues = check_image_spelling(qa_img, qa_ctype, post_context)
+        print(f"[image-qa] attempt {attempt} [{model_used}]: {'OK' if ok else 'BAD'} "
+              f"{('- ' + issues) if issues else ''}")
+        if ok:
+            return qa_img, qa_ctype, True
+        best = (qa_img, qa_ctype)  # keep the latest failed attempt only as a last-resort fallback
+        prompt = _build_retry_prompt(full_prompt, issues)
+    if best is None:
+        return None, None, False
+    return best[0], best[1], False  # exhausted all attempts, still BAD - flag it
 
 
-def _create_cloudflare_image(clean_prompt: str, elements: dict, errors: list) -> tuple[bytes | None, str]:
-    best = _generate_image_with_qa(clean_prompt, errors)
-    if not best:
-        return None, "jpg"
-    image_bytes, content_type = best
-    ext = "jpg"
-    image_bytes, content_type, ext = _try_apply_overlay(image_bytes, content_type, ext, elements)
-    image_bytes, content_type, ext = _ensure_png_output(image_bytes, content_type, ext)
-    return image_bytes, ext
+def _render_text_free_image(full_prompt: str, errors: list, post_context: str, issues: str = "") -> tuple:
+    prompt = _build_text_free_prompt(full_prompt, issues)
+    for attempt in range(1, TEXT_FREE_IMAGE_ATTEMPTS + 1):
+        generated = _generate_via_models(prompt, errors, 1)
+        if generated is None:
+            break
+        img, ctype, model_used = generated
+        qa_img, qa_ctype = _normalize_to_png(img, ctype)
+        ok, retry_issues = check_image_spelling(qa_img, qa_ctype, post_context)
+        print(f"[image-qa] text-free fallback {attempt} [{model_used}]: {'OK' if ok else 'BAD'} "
+              f"{('- ' + retry_issues) if retry_issues else ''}")
+        if ok:
+            return qa_img, qa_ctype, True
+        prompt = _build_text_free_prompt(full_prompt, retry_issues)
+    return None, None, False
 
 
 def generate_image(state: PipelineState) -> PipelineState:
     full_prompt = state["image_prompt"].strip()
-    errors: list[str] = []
-    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_KEY:
+    post_context = f"Topic: {state['topic']}\n\nPost:\n{state['post_text']}"
+    image_bytes = None
+    ext = "jpg"
+    errors = []
+    qa_passed = False
+
+    if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_KEY:
+        print(f"[image] Cloudflare Workers AI ({CF_FLUX2_KLEIN}) | prompt: {full_prompt[:200]}...")
+        img, ctype, qa_passed = _render_best_image(full_prompt, errors, post_context)
+        if img is not None:
+            image_bytes, content_type = _normalize_to_png(img, ctype)
+            ext = "png" if "png" in content_type else "jpg"
+    else:
         errors.append("CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY missing from .env")
-        raise RuntimeError(f"Image generation failed: {'; '.join(errors)}")
-    elements, clean_prompt = _extract_text_and_clean_prompt(full_prompt)
-    if not elements["headline"] and not elements["labels"]:
-        # Last resort: never ship 0-overlay (pure diffusion text). Derive from post.
-        elements = _fallback_elements(state.get("post_text", ""), state.get("topic", ""))
-        print(f"[image] Gemini gave 0 text fragments, fallback overlay: "
-              f"\"{elements['headline']}\" + {len(elements['labels'])} labels")
-    print(f"[image] Cloudflare Workers AI | prompt: {clean_prompt[:200]}...")
-    print(f"[image] overlay: \"{elements['headline']}\" + {len(elements['labels'])} labels")
-    image_bytes, ext = _create_cloudflare_image(clean_prompt, elements, errors)
+
     if image_bytes is None:
-        # ultimate fallback: don't crash pipeline, post placeholder with overlay
-        print(f"[image] all Cloudflare attempts failed ({'; '.join(errors)[:200]}) - using placeholder")
-        image_bytes = _create_placeholder_image()
-        try:
-            image_bytes = _overlay_text(image_bytes, elements)
-        except Exception as exc:
-            print(f"[image] placeholder overlay failed ({exc})")
-        ext = "png"
+        print(f"[image] failed on all Cloudflare models - posting text only: {'; '.join(errors)[:240]}")
+        state["image_path"] = ""
+        return state
+
+    if not qa_passed:
+        print("[image] spelling/relevance QA failed - trying text-free related image...")
+        img, ctype, qa_passed = _render_text_free_image(full_prompt, errors, post_context)
+        if img is None or not qa_passed:
+            print("[image] text-free fallback also failed QA - posting text only")
+            state["image_path"] = ""
+            return state
+        image_bytes, content_type = _normalize_to_png(img, ctype)
+        ext = "png" if "png" in content_type else "jpg"
+
     image_path = os.path.join(IMAGES_DIR, f"post_image_{int(time.time())}.{ext}")
     with open(image_path, 'wb') as file:
         file.write(image_bytes)
@@ -871,6 +653,10 @@ def generate_image(state: PipelineState) -> PipelineState:
 # ---- Node 7: Publish the actual post to LinkedIn ----
 def post_to_linkedin(state: PipelineState) -> PipelineState:
     person_urn = get_person_urn(LINKEDIN_TOKEN)
+    if not state.get("image_path"):
+        post_id = create_post(LINKEDIN_TOKEN, person_urn, state["post_text"])
+        print("Posted text-only successfully:", post_id)
+        return state
     upload_url, image_urn = register_image_upload(LINKEDIN_TOKEN, person_urn)
     upload_image_binary(upload_url, state["image_path"], LINKEDIN_TOKEN)
     post_id = create_post(LINKEDIN_TOKEN, person_urn, state["post_text"], image_urn)
@@ -880,17 +666,23 @@ def post_to_linkedin(state: PipelineState) -> PipelineState:
 
 # ---- Node 8: Save history (plain text JSON + ChromaDB, for duplicate detection next time) ----
 def save_history(state: PipelineState) -> PipelineState:
+    # Append to the plain-text history file (git-friendly; survives GitHub Actions runs).
     history = []
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 history = json.load(f)
         except (json.JSONDecodeError, OSError):
-            pass
+            history = []
     history.append(state["post_text"])
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False)
-    collection.add(documents=[state["post_text"]], ids=[f"post_{collection.count() + 1}"])
+
+    # Also add to the ChromaDB collection (used live for uniqueness within this run).
+    collection.add(
+        documents=[state["post_text"]],
+        ids=[f"post_{collection.count() + 1}"],
+    )
     print(f"[history] saved {len(history)} posts to posts_history.json")
     return state
 

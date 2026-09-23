@@ -178,100 +178,45 @@ ALL_RSS_FEEDS = [f for d in TOPIC_DOMAINS.values() for f in d["feeds"]]
 ALL_EVERGREEN_TOPICS = [t for d in TOPIC_DOMAINS.values() for t in d["evergreen"]]
 
 
-# ====================================================================
-# 2) IMAGE STYLE ENGINE - AGENT-DRIVEN (exactly like your 2 references)
-#    Gemini IS the art director. It picks ONE of the 2 viral templates
-#    and writes the complete ready-to-use prompt. Pipeline just uses it
-#    as-is + seed. No random style layering.
-# ====================================================================
+CONCEPT_VISUAL_EXAMPLES = """
+- Parallel/divided work (e.g. multiple specialized agents each owning a task):
+  several distinct real workers or objects positioned side by side in one
+  frame, each doing a visibly different action, unified by shared lighting -
+  NOT a single path or sequence.
+- Sequential/step-by-step (e.g. a journey, a growing process over time):
+  one continuous path or progression the eye follows in order, like a trail
+  with waypoints, or the same subject shown across successive stages.
+- Comparison/contrast (e.g. X vs Y, old way vs new way):
+  a clean visual split between two real scenes or objects that embody each
+  side, unified by matching composition and lighting.
+- Hierarchy/framework (e.g. levels of a skill, a pyramid of needs):
+  physical objects stacked or layered by size/height, biggest or foundational
+  at the base.
+- Overlap/intersection (e.g. where two ideas or skill sets meet):
+  two or three translucent forms (light, glass, fabric) physically overlapping,
+  the overlap itself visually distinct.
+- Single powerful insight/quote: one quiet, evocative real moment or object
+  that embodies the idea - no need for multiple elements at all.
+"""
 
-# 15 proven viral templates - reverse-engineered from LinkedIn top posts
-VIRAL_TEMPLATES = {
-    "comic": (
-        "6-panel comic strip, 3 rows x 2 columns, thick black panel borders, "
-        "flat vector cartoon style, clean bold outlines, soft flat colors, "
-        "speech bubbles with SHORT perfectly legible English text (max 8 words per bubble), "
-        "expressive characters, white background, trending LinkedIn humor comic"
-    ),
-    "roadmap": (
-        "dark navy tech roadmap infographic, vertical glowing flowchart with luminous "
-        "cyan-teal connections branching from left central node into 7 glassmorphism "
-        "category cards on the right, each card with small icon and 2-3 word label, "
-        "circuit-board background with faint traces, neon glow, premium dark vector, "
-        "perfectly legible English labels, no gibberish"
-    ),
-    "comparison": (
-        "premium corporate comparison infographic, 4 large rounded cards in 2x2 grid "
-        "each with bold color-coded header, icon and 3 bullet lines, top hero with "
-        "isometric 3D illustrations on circuit board, cream-beige background with subtle "
-        "grid and technical line art, crisp vector editorial layout, perfectly legible English"
-    ),
-    "sketch_story": (
-        "editorial hand-drawn explainer infographic, white background with ink sketch "
-        "illustrations, central bridge/arch metaphor connecting two concepts, speech bubbles, "
-        "arrows, small character silhouettes, orange and blue accent highlights, newspaper "
-        "infographic style, clean doodle with perfectly legible English typography"
-    ),
-    "billboard": (
-        "bold minimal poster infographic, huge black condensed headline at top occupying "
-        "30% of canvas, 6 uniform hand-sketched icons in 2x3 grid below each with short "
-        "bold label underneath, off-white paper background, high contrast, viral billboard style, "
-        "perfectly legible English"
-    ),
-    "animated-image": (
-        "animated image, 6 panels in 2x3 grid, each panel with smooth transitions, "
-        "flat vector cartoon style, clean bold outlines, soft flat colors, "
-        "speech bubbles with SHORT perfectly legible English text (max 8 words per bubble), "
-        "expressive characters, with beautiful background, trending LinkedIn humor comic, "
-        "crisp vector, 8k, ultra-detailed, perfectly legible English, "
-        "showing a smooth flow of the story in each panel, with a clear beginning, middle, and end, "
-    ),
-    "automation-flow-diagram": (
-        "automation flow diagram, matching background with lines, don't overcrowd, clear and simple, "
-        "with a clear beginning, middle, and end, "
-        "with clearly moving cutting-edge lines connecting each process to the next, "
-    ),
-    # --- New wide-variety LinkedIn-native templates ---
-    "timeline": (
-        "horizontal timeline infographic, left-to-right chronological flow with 5-6 circular "
-        "milestone nodes connected by thick line, dated labels below each node, soft gradient "
-        "background, premium vector, perfectly legible English, clean LinkedIn timeline style"
-    ),
-    "pyramid": (
-        "pyramid hierarchy infographic, stacked triangular levels with bold level titles and small "
-        "icons inside each tier, subtle drop shadows, cream-beige background, crisp vector editorial, "
-        "perfectly legible English labels, LinkedIn framework style"
-    ),
-    "stats_dashboard": (
-        "stats dashboard infographic, 4 large metric cards in 2x2 grid with huge bold numbers, "
-        "small icons, colored trend arrows and mini sparklines, dark navy header, light background, "
-        "premium corporate vector, perfectly legible English, viral LinkedIn stats post"
-    ),
-    "matrix_2x2": (
-        "2x2 matrix quadrant infographic, four quadrants with bold headers, icons and 2 bullet points each, "
-        "central cross lines, muted color coding per quadrant, clean minimal vector, perfectly legible English, "
-        "LinkedIn framework post style"
-    ),
-    "checklist": (
-        "checklist infographic, vertical list of 5-6 items with green checkmark circles, bold item titles "
-        "and one-line descriptions, subtle divider lines, off-white card, minimal vector, perfectly legible English, "
-        "viral LinkedIn checklist style"
-    ),
-    "venn_diagram": (
-        "3-circle Venn diagram infographic, overlapping translucent pastel circles with centered labels "
-        "and intersection tags, soft colors, white background, clean vector, perfectly legible English, LinkedIn explainer"
-    ),
-    "funnel": (
-        "vertical funnel infographic, top-wide to bottom-narrow 4 stages with icons and 2-word labels, "
-        "downward arrows, gradient fill from teal to navy, white background, crisp vector, perfectly legible English, "
-        "LinkedIn marketing funnel style"
-    ),
-    "quote_card": (
-        "bold quote card infographic, huge centered serif quote text occupying 50% canvas, attribution line below, "
-        "minimal geometric accent, off-white paper texture, high contrast black text, viral LinkedIn quote style, "
-        "perfectly legible English"
-    ),
-}
+
+VISUAL_DIRECTIONS = [
+    "6-panel comic strip with expressive characters and thick black panel borders",
+    "4-panel mistake-to-fix story with warning icons, anxious face, then resolution",
+    "two-character dialogue scene with short speech bubbles and a clear visual punchline",
+    "hand-drawn bridge metaphor connecting old workflow to better outcome",
+    "before-and-after split sketch showing broken process versus safer process",
+    "whiteboard doodle map with arrows, simple objects, and one central metaphor",
+    "ladder of levels where each step shows a practical maturity stage",
+    "cause-effect chain with objects triggering the next visible consequence",
+    "warning-to-solution scene with hazard signs, guardrails, and a final safe path",
+    "mini roadmap with 3 checkpoints drawn as physical gates or stations",
+    "workbench scene where people compare modular pieces and choose the safer one",
+    "factory line metaphor where bad inputs are inspected before deployment",
+    "detective investigation board with clues, pins, and a clear root-cause reveal",
+    "mentor-student whiteboard lesson with one confused learner and one clear fix",
+    "control-room scene with dashboards replaced by physical gauges and human review",
+]
 
 
 # ====================================================================
@@ -294,6 +239,11 @@ def content_prompt(topic: str) -> str:
         "- Include exactly ONE concrete takeaway or actionable insight.\n"
         "- Close with a strong one-liner + emoji, then a final line of 5-7 additional hashtags "
         "(e.g. #AI #Innovation #Growth). This final hashtag line is mandatory.\n"
+        "- Before answering, silently self-check every rule above (hook under 200 characters, "
+        "5-7 emojis, hashtags woven into the body, mandatory final hashtag line, exactly one "
+        "concrete takeaway, and NO cliches like 'game-changer', 'in today's world' or "
+        "'delve into') and fix anything that fails. Getting it right first time avoids a "
+        "whole extra review round.\n"
         "Return only the post text, nothing else."
     )
 
@@ -334,76 +284,64 @@ def revise_prompt(post_text: str, feedback: str) -> str:
     )
 
 
-def image_prompt_gen(post_text: str) -> str:
+def image_prompt_gen(post_text: str, topic: str = "", visual_direction: str = "") -> str:
     return (
-        "You are a viral LinkedIn art director. Pick EXACTLY ONE template (15 choices) and write "
-        "ONE ready-to-use image prompt (60-80 words, comma phrases).\n"
-        "STRICT OUTPUT FORMAT: output ONLY the visual description starting directly with style words. "
-        "Never write TEMPLATE, never write the template letter/name, never explain your choice.\n\n"
-        "TEMPLATE A - COMIC (humor/relatable/AI fails):\n"
-        f"\"{VIRAL_TEMPLATES['comic']}\" + describe 6 panels + EXACT speech bubble texts (5-8 words each, funny, FROM the post)\n\n"
-        "TEMPLATE B - ROADMAP (tech stacks/tools/skills, e.g. AI Agent Development):\n"
-        f"\"{VIRAL_TEMPLATES['roadmap']}\" + list 6-7 categories and 3-4 items per category with icons, ALL TEXT FROM post\n\n"
-        "TEMPLATE C - COMPARISON (comparisons like GPU vs TPU, X vs Y):\n"
-        f"\"{VIRAL_TEMPLATES['comparison']}\" + 4 cards with headers, bullets and hero illustration, ALL TEXT FROM post\n\n"
-        "TEMPLATE D - SKETCH_STORY (paradox/narrative/future-of-work):\n"
-        f"\"{VIRAL_TEMPLATES['sketch_story']}\" + bridge metaphor, annotations, 3 levels, ALL TEXT FROM post\n\n"
-        "TEMPLATE E - BILLBOARD (listicles like 'How to stay poor', 5-6 habits):\n"
-        f"\"{VIRAL_TEMPLATES['billboard']}\" + huge headline + 6 icons with labels, ALL TEXT FROM post\n\n"
-        "TEMPLATE F - TIMELINE (journey/process over time):\n"
-        f"\"{VIRAL_TEMPLATES['timeline']}\" + 5-6 milestone nodes with dates/labels, ALL TEXT FROM post\n\n"
-        "TEMPLATE G - PYRAMID (hierarchy/framework, e.g. Maslow, tech stack):\n"
-        f"\"{VIRAL_TEMPLATES['pyramid']}\" + stacked levels with titles/icons, ALL TEXT FROM post\n\n"
-        "TEMPLATE H - STATS_DASHBOARD (metrics/KPIs, numbers heavy):\n"
-        f"\"{VIRAL_TEMPLATES['stats_dashboard']}\" + 4 metric cards with huge numbers/icons, ALL TEXT FROM post\n\n"
-        "TEMPLATE I - MATRIX_2X2 (quadrants like Eisenhower, SWOT):\n"
-        f"\"{VIRAL_TEMPLATES['matrix_2x2']}\" + 4 quadrants with headers/bullets, ALL TEXT FROM post\n\n"
-        "TEMPLATE J - CHECKLIST (habits, mistakes, steps):\n"
-        f"\"{VIRAL_TEMPLATES['checklist']}\" + 5-6 check items with titles, ALL TEXT FROM post\n\n"
-        "TEMPLATE K - VENN_DIAGRAM (overlap/intersection concepts):\n"
-        f"\"{VIRAL_TEMPLATES['venn_diagram']}\" + 3 overlapping circles with labels, ALL TEXT FROM post\n\n"
-        "TEMPLATE L - FUNNEL (sales/marketing/process stages):\n"
-        f"\"{VIRAL_TEMPLATES['funnel']}\" + 4 funnel stages with icons/labels, ALL TEXT FROM post\n\n"
-        "TEMPLATE M - QUOTE_CARD (single powerful insight):\n"
-        f"\"{VIRAL_TEMPLATES['quote_card']}\" + one bold quote pulled FROM post, attribution\n\n"
-        "TEMPLATE N - ANIMATED (story flow like comic but animated look):\n"
-        f"\"{VIRAL_TEMPLATES['animated-image']}\" + 6 panels with flow, FROM post\n\n"
-        "TEMPLATE O - AUTOMATION_FLOW (workflows/systems):\n"
-        f"\"{VIRAL_TEMPLATES['automation-flow-diagram']}\" + connected flow steps with icons, FROM post\n\n"
-        "CRITICAL CAPTION ALIGNMENT RULE (must follow):\n"
-        "- Every word inside the image (bubbles/labels/headers/bullets) MUST be directly "
-        "taken from or paraphrased from the Post below. Do NOT invent unrelated labels. "
-        "If post is about 'RAG mistakes', image must say RAG-related labels, not generic AI.\n"
-        "RULES:\n"
-        "- Choose the ONE template that best fits the post's structure.\n"
-        "- Output ONLY the final prompt, no explanation.\n"
-        "- Keep each text fragment under 5 words for legibility.\n"
-        "- Use AT MOST 7 separate text fragments in the whole image (1 headline + max 6 labels). "
-        "Match the template: 3-4 labels for comparison/matrix/stats/funnel/venn, "
-        "5-6 only for comic/billboard/checklist/roadmap/timeline which need more items. "
-        "Fewer is better - text models misspell long text. Prefer icons + 1-3 word labels over sentences.\n"
-        "- Every label must be UNIQUE - never repeat the same word or label twice in "
-        "the image. Do not add filler icons just to fill a grid; fewer, varied items look better.\n"
-        "- Use only simple, common English words that are spelled the way they sound. "
-        "Never invent words or blend words together.\n"
-        "- Write every text fragment as: exact text: \"AI Agents\" - so the pipeline "
-        "can extract and overlay it with perfect spelling.\n"
-        "- Keep labels grammatically correct and natural in plain English "
-        "(e.g., short noun phrases or simple verb phrases).\n"
-        "- Avoid rare/technical spellings, acronyms longer than 5 letters, and punctuation "
-        "inside quoted labels (apostrophes, ampersands) - they cause typos.\n"
-        "- Always end with: 'crisp vector, 8k, ultra-detailed, clean layout, "
-        "NO text rendered in image, blank spaces for text overlay'\n\n"
+        "You are a viral LinkedIn cartoon-infographic art director. Create an image like "
+        "a hand-drawn LinkedIn explainer: comic panels, speech bubbles, sketch labels, "
+        "bridge metaphors, arrows, and simple characters/objects that tell the idea.\n"
+        f"POST TOPIC LABEL: {topic or 'unspecified'}\n\n"
+        f"THIS RUN'S VISUAL DIRECTION: {visual_direction or 'choose the best fitting direction'}.\n"
+        "Follow this direction unless it clearly conflicts with the post.\n\n"
+        "Silently identify the post's structure: parallel work, sequence, comparison, "
+        "hierarchy, overlap/intersection, or one standalone insight. Then choose ONE "
+        "visual format: 6-panel comic story, 4-panel mistake-to-fix story, two-character "
+        "dialogue, hand-drawn bridge explainer, before/after split sketch, whiteboard "
+        "doodle map, ladder of levels, cause-effect chain, warning-to-solution scene, "
+        "mini roadmap, or simple process flow. Inspiration only:\n"
+        f"{CONCEPT_VISUAL_EXAMPLES}\n"
+        "Return only a 90-130 word image prompt. Start with the concrete subject from "
+        "the topic/post. Include 2-4 EXACT readable text fragments in quotes, each 1-3 "
+        "simple English words, and make them part of the illustration as speech bubbles, "
+        "callout labels, or sign text. Use no other text.\n\n"
+        "Rules: clean hand-drawn cartoon infographic style, thick black outlines, white "
+        "background, LinkedIn explainer look, topic-specific artifacts, expressive human "
+        "or robot characters when useful, clear flow/story, generous spacing, large lettering, "
+        "no photo-realistic stock image. "
+        "For AI/model topics, show concrete model ecosystem artifacts: server racks, GPU "
+        "trays, open workbenches, modular model blocks, researchers comparing systems, "
+        "deployment paths. Avoid loose symbols like crowns, chess pieces, trophies, random "
+        "monoliths, generic glowing brains, circuit wallpaper, and robot hands. Every quoted "
+        "text fragment must be spelled exactly and legible; no gibberish, no extra letters, "
+        "no repeated filler text, no watermark.\n\n"
         f"Post:\n{post_text[:500]}"
     )
 
-def image_qa_prompt() -> str:
+
+def image_qa_prompt(post_context: str = "") -> str:
+    relevance = ""
+    if post_context.strip():
+        relevance = (
+            "RELEVANCE CHECK (caption-image match): this image was generated for a LinkedIn "
+            "post with this context:\n"
+            f"\"{post_context[:500]}\"\n"
+            "Would a reader of that post instantly recognize the picture as being about the "
+            "same idea? PASS when the scene clearly shows the post's central subject with "
+            "concrete domain artifacts. Creative metaphors count only when anchored by the "
+            "topic's real domain. FAIL when the image is generic stock filler, abstract "
+            "wallpaper, or only a loose symbol like crowns, chess pieces, scales, trophies, "
+            "random monoliths, or power objects with no visible connection to the topic.\n\n"
+        )
     return (
-        "You are a text-proofreader for an AI-generated image. "
-        "Diffusion models often garble text, so verify every clearly-intended "
-        "visible text fragment carefully before passing it.\n\n"
-        "NOTE: If the image is intentionally text-free (no words, letters, "
-        "numbers, or captions), this is PERFECTLY ACCEPTABLE. Answer VERDICT: OK.\n\n"
+        "You are a text-proofreader AND caption-relevance reviewer for an AI-generated image. "
+        "Diffusion models often garble text AND drift off-topic, so verify both before "
+        "passing it.\n\n"
+        "Expected style: a hand-drawn LinkedIn explainer, comic, bridge sketch, comparison "
+        "sketch, or simple process flow. Speech bubbles and short labels are allowed only "
+        "when they are readable, correctly spelled, grammatical, and relevant. FAIL generic "
+        "photo-realistic stock images, random decorative overlays, slide/dashboard UI, or "
+        "abstract symbols with no concrete connection to the topic. A fully text-free image "
+        "is OK when it is clearly related to the post's topic.\n\n"
+    ) + relevance + (
         "STEP 1 - TRANSCRIBE: List every separate text fragment that is meant to "
         "be read - titles, labels, bullets, signs, anything inside speech bubbles. "
         "Ignore text that is too small, blurry, or in the far background to read "
@@ -421,8 +359,7 @@ def image_qa_prompt() -> str:
         "look, mark it WRONG - do not guess.\n\n"
         "Answer in EXACTLY this format, nothing else:\n"
         "TEXTS: <all listed fragments, comma-separated, or 'none' if none qualify>\n"
-        "VERDICT: OK   (only if every listed fragment passes all checks a-e)\n"
-        "VERDICT: BAD  (if any listed fragment fails any check)\n"
-        "ISSUES: <comma-separated list: the wrong text you saw and what it should be; "
-        "write 'none' if verdict is OK>"
+        "VERDICT: <OK or BAD>\n"
+        "ISSUES: <comma-separated list: the wrong text, layout problem, or 'UNRELATED: <the "
+        "concrete scene this post actually needs instead>'; write 'none' if verdict is OK>"
     )

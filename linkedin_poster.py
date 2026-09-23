@@ -83,8 +83,8 @@ def upload_image_binary(upload_url: str, image_path: str, access_token: str) -> 
     _check(resp)
 
 
-def create_post(access_token: str, person_urn: str, text: str, image_urn: str) -> str:
-    """Create the final post (text + image), returning the post ID."""
+def create_post(access_token: str, person_urn: str, text: str, image_urn: str | None = None) -> str:
+    """Create the final post, optionally with an image, returning the post ID."""
     url = "https://api.linkedin.com/rest/posts"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -101,10 +101,11 @@ def create_post(access_token: str, person_urn: str, text: str, image_urn: str) -
             "targetEntities": [],
             "thirdPartyDistributionChannels": [],
         },
-        "content": {"media": {"id": image_urn}},
         "lifecycleState": "PUBLISHED",
         "isReshareDisabledByAuthor": False,
     }
+    if image_urn:
+        body["content"] = {"media": {"id": image_urn}}
     resp = requests.post(url, headers=headers, json=body)
     _check(resp)
     return resp.headers.get("x-restli-id")  # The post ID.

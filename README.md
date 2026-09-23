@@ -1,195 +1,301 @@
-# LinkedIn Post AI — Automated Viral Post Pipeline
+# LinkedIn Post AI
 
-> Autonomous LangGraph pipeline that generates scroll-stopping LinkedIn posts (text + image) and publishes them on schedule. Text by **Gemini (3.6 Flash + 3.1 Flash Lite fallback)**, images by **Cloudflare Workers AI (FLUX.2 klein-4b)**, orchestration by **LangGraph**, duplicate guard by **ChromaDB**.
+Automated LinkedIn posting pipeline powered by Gemini, Cloudflare Workers AI, LangGraph, and ChromaDB.
 
-![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
-![LangGraph](https://img.shields.io/badge/LangGraph-0.2-orange)
-![Cloudflare](https://img.shields.io/badge/image-Cloudflare%20Workers%20AI-orange)
+It picks a topic, writes a LinkedIn post, self-critiques it, generates a related hand-drawn explainer image, checks the image for spelling and relevance, publishes to LinkedIn, and saves history so future posts do not repeat.
 
----
+## What It Does
 
-## ✨ What it does
+1. Picks a fresh topic from RSS feeds plus evergreen topic lists.
+2. Writes a LinkedIn post with Gemini.
+3. Critiques the draft and revises weak posts.
+4. Generates an image prompt using one of 15 rotating visual directions.
+5. Creates a LinkedIn-style hand-drawn comic/explainer image with Cloudflare Workers AI.
+6. Checks image text and topic relevance with Gemini Vision.
+7. If text in the image is misspelled, retries with simpler text.
+8. If text still fails, tries a fully related text-free image.
+9. If image generation still fails QA, posts text-only instead of stopping the run.
+10. Publishes to LinkedIn and stores post history.
 
-1. Picks a **fresh topic** from live RSS feeds + curated evergreen lists (AI, Automation, DevNews, Business, Career, Psychology, Science, Design, Money).
-2. Writes the post with **Gemini 3.6 Flash** (auto-fallback to 3.1 Flash Lite on quota exhaustion), self-critiques & revises until `score ≥ 7/10`.
-3. Generates an **agent-driven image prompt** (Gemini picks 1 of 7 viral templates) and renders it via **Cloudflare Workers AI** (`flux-2-klein-4b` → `flux-2-dev` → `flux-1-schnell` → SDXL fallback chain).
-4. Checks uniqueness via **ChromaDB**, publishes to LinkedIn (OAuth v2), and persists history for the next run.
+## Project Structure
 
----
-
-## 📁 Project Structure
-
-```
-LinkedIn_Post_Automation/
-├── linkedin_pipeline.py      # Main LangGraph pipeline (8 nodes)
-├── post_prompts.py           # Single source of truth: domains, templates, prompts
-├── linkedin_poster.py        # LinkedIn OAuth + image upload + post creation
-├── requirements.txt          # Python deps
-├── .env.example              # Template for required env vars
-│
-├── .gitignore                # Ignores .env, images/, post_history_db/
-├── post_history_db/          # ChromaDB persistent store (local only, git-ignored)
-├── images/                   # Generated images (git-ignored)
-├── posts_history.json        # Git-tracked post history for persistence / seeding
-├── .github/workflows/auto_post.yml  # Cloud scheduler — every 4 days at 09:00 UTC
-│
-└── GITHUB_ACTIONS_SETUP.md   # Step-by-step cloud deploy guide
+```text
+LinkedIn_Post_AI/
+|-- linkedin_pipeline.py              # Main LangGraph pipeline
+|-- post_prompts.py                   # Topics, content prompts, image prompts, QA prompt
+|-- linkedin_poster.py                # LinkedIn OAuth, image upload, post creation
+|-- requirements.txt                  # Python dependencies
+|-- posts_history.json                # Git-friendly post history for duplicate checks
+|-- images/                           # Generated images, git-ignored
+|-- post_history_db/                  # ChromaDB local store, git-ignored
+|-- .env.example                      # Optional local env template
+|-- .github/workflows/auto_post.yml   # GitHub Actions scheduler
+`-- GITHUB_ACTIONS_SETUP.md           # Optional cloud setup notes
 ```
 
----
+## Pipeline Flow
 
-## 🔄 Pipeline Flow (LangGraph)
+<div align="center">
 
-```
-pick_topic ──► generate_content ──► critique_post ───┐
-                              ▲                      │
-                         revise_content ◄────────────┘
-                              │ (score ≥ 7 or 2 revisions)
-                              ▼
-                  generate_image_prompt (Gemini picks 1 of 7 templates)
-                              │
-                              ▼
-                    check_uniqueness (ChromaDB, threshold 0.85)
-                         │         │
-                    unique    duplicate ──► pick_topic (retry ×3)
-                         │
-                         ▼
-                    generate_image (Cloudflare Workers AI, flux-2-klein-4b)
-                         │
-                         ▼
-                  post_to_linkedin (upload + create post)
-                         │
-                         ▼
-                    save_history (posts_history.json + ChromaDB)
+```mermaid
+flowchart TD
+    A[pick_topic] --> B[generate_content]
+    B --> C[critique_post]
+    C -->|score is low and revisions remain| D[revise_content]
+    D --> C
+    C -->|quality gate passed| E[generate_image_prompt]
+    E --> F[check_uniqueness]
+    F -->|duplicate and retries remain| A
+    F -->|unique or retry limit reached| G[generate_image]
+    G --> H{Image QA passed?}
+    H -->|yes| I[post_to_linkedin with image]
+    H -->|bad image text| J[text-free related image fallback]
+    J --> K{Fallback QA passed?}
+    K -->|yes| I
+    K -->|no| L[post_to_linkedin text-only]
+    I --> M[save_history]
+    L --> M
 ```
 
-**Nodes in `linkedin_pipeline.py`:**
-| Node | Description |
+</div>
+
+## Pipeline Nodes
+
+| Node | Purpose |
 |---|---|
-| `pick_topic` | Random from `get_topic_pool()` (RSS + evergreen), avoids `tried_topics` |
-| `generate_content` | `call_gemini(content_prompt())` |
-| `critique_post` | LLM critic + deterministic penalties (clichés, hashtags, emojis) |
-| `revise_content` | `call_gemini(revise_prompt())` |
-| `generate_image_prompt` | `call_gemini(image_prompt_gen())` — 7 templates |
-| `check_uniqueness` | `collection.query()` cosine distance |
-| `generate_image` | Cloudflare Workers AI with PIL text overlay |
-| `post_to_linkedin` | `linkedin_poster.py` upload + create post |
-| `save_history` | Appends to history + ChromaDB |
+| `pick_topic` | Picks a topic from RSS titles plus evergreen lists. |
+| `generate_content` | Calls Gemini with `content_prompt(topic)`. |
+| `critique_post` | Scores the post and adds deterministic penalties for cliches, missing hashtags, or too few emojis. |
+| `revise_content` | Rewrites the post using critic feedback. |
+| `generate_image_prompt` | Rotates through 15 visual directions and asks Gemini for a topic-specific image prompt. |
+| `check_uniqueness` | Uses ChromaDB similarity against previous posts. |
+| `generate_image` | Calls Cloudflare Workers AI and runs Gemini Vision QA. |
+| `post_to_linkedin` | Posts with image if QA passed, otherwise posts text-only. |
+| `save_history` | Appends post text to `posts_history.json` and ChromaDB. |
 
----
+## Image System
 
-## 🖼️ Image Templates (Agent-Driven)
+The image system is designed for LinkedIn-style explainers, not generic stock photos.
 
-Gemini chooses **exactly one** per post. Defined in `post_prompts.py:190` `VIRAL_TEMPLATES`:
+`post_prompts.py` contains 15 rotating visual templates in `VISUAL_DIRECTIONS`. Gemini picks one direction per run and then writes a topic-specific Cloudflare image prompt.
 
-| Key | Use When | Style |
-|---|---|---|
-| `comic` | Humor / AI fails / relatable work | 6-panel 3×2 comic, flat vector, speech bubbles ≤8 words |
-| `roadmap` | Tech stacks / skills | Dark navy glowing flowchart, 7 glass cards, cyan circuit traces |
-| `comparison` | X vs Y (GPU vs TPU) | 4 cards 2×2, color-coded headers, isometric hero, cream grid |
-| `sketch_story` | Paradox / narrative | Hand-drawn ink, bridge metaphor, orange/blue highlights |
-| `billboard` | Listicles (How to stay poor) | Huge headline + 6 icons 2×3 grid, high contrast |
-| `animated-image` | Multi-panel story progression | 6-panel story flow, clean vector cartoon, speech bubbles ≤8 words |
-| `automation-flow-diagram` | Process / workflow automation | Clear flowchart with connecting lines, simple background, step-by-step |
+Template examples include comic panels, mistake-to-fix stories, two-character dialogue, bridge sketches, before/after sketches, whiteboard maps, roadmaps, workbench scenes, investigation boards, and control-room review scenes.
 
-**Text overlay:** Image is generated text-free, then PIL renders headline + labels with perfect spelling.
+The rotation is deterministic, based on post history and retry state, so consecutive posts are encouraged to look different. Edit `VISUAL_DIRECTIONS` if you want to add, remove, or rename image styles.
 
----
+## Image QA And Fallbacks
 
-## 🚀 Quick Start (Local)
+Image generation follows this order:
+
+1. Generate a hand-drawn explainer with 2-4 short labels or speech bubbles.
+2. Gemini Vision transcribes visible text and checks spelling, grammar, legibility, duplicates, layout, and topic relevance.
+3. If QA fails, retry with fewer and simpler text fragments.
+4. If labeled images keep failing, generate a text-free image that still clearly shows the topic.
+5. If that also fails, publish the LinkedIn post without an image.
+
+This avoids posting images with misspellings like `WORKOWK`, `EXECUUTE`, or unrelated visuals.
+
+## Models
+
+Text generation:
+
+- `gemini-3.6-flash`
+- `gemini-3.1-flash-lite` fallback
+
+Image generation:
+
+- `@cf/black-forest-labs/flux-2-klein-4b`
+- `@cf/black-forest-labs/flux-2-dev`
+- `@cf/black-forest-labs/flux-1-schnell`
+- `@cf/stabilityai/stable-diffusion-xl-base-1.0`
+
+## Quick Start
+
+Clone the repository:
 
 ```bash
-# 1. Clone & install
-git clone https://github.com/DharamVeer970/LinkedIN_Post_Automation.git && cd LinkedIN_Post_Automation
+git clone https://github.com/DharamVeer970/LinkedIN_Post_Automation.git
+cd LinkedIN_Post_Automation
+```
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# Linux/Mac
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+pip install --upgrade pip
 pip install -r requirements.txt
-
-# 2. Configure secrets
-cp .env.example .env
-# Edit .env — set these values:
-# GEMINI_API_KEY=...
-# LINKEDIN_TOKEN=...          # from linkedin_poster.py auth flow
-# CLOUDFLARE_ACCOUNT_ID=...
-# CLOUDFLARE_API_KEY=...
-# CLIENT_ID=... / CLIENT_SECRET=...  # LinkedIn Developer App
-
-# 3. One-time LinkedIn auth (gets LINKEDIN_TOKEN)
-python linkedin_poster.py
-# → open the printed URL, authorize, paste the ?code= value
-
-# 4. Run once
-python linkedin_pipeline.py
-# Check images/ and LinkedIn feed
 ```
 
-### Requirements `requirements.txt:1`
+Create `.env` in the project root:
 
+```text
+GEMINI_API_KEY=your_gemini_key
+LINKEDIN_TOKEN=your_linkedin_access_token
+CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+CLOUDFLARE_API_KEY=your_cloudflare_workers_ai_token
+CLIENT_ID=your_linkedin_client_id
+CLIENT_SECRET=your_linkedin_client_secret
 ```
-requests>=2.28
-python-dotenv>=1.0
-feedparser>=6.0
-chromadb>=0.4
-langgraph>=0.2
-pillow>=10.0
-```
 
----
-
-## 🔑 Environment Variables
-
-| Var | Source | Required | Notes |
-|---|---|---|---|
-| `GEMINI_API_KEY` | https://aistudio.google.com/apikey | ✅ | Gemini 3.6 Flash + 3.1 Flash Lite fallback |
-| `CLOUDFLARE_ACCOUNT_ID` | https://dash.cloudflare.com (Workers & Pages → sidebar) | ✅ | Cloudflare account ID |
-| `CLOUDFLARE_API_KEY` | https://dash.cloudflare.com/profile/api-tokens | ✅ | API token with **Workers AI: Edit** permission (`linkedin_pipeline.py:59`) |
-| `LINKEDIN_TOKEN` | `linkedin_poster.py:26` OAuth | ✅ | ~60 days validity |
-| `CLIENT_ID` / `CLIENT_SECRET` | LinkedIn Developer Portal | ✅ (once) | For `get_authorization_url()` |
-
-`.env` is git-ignored (`.gitignore:3`). Never commit it.
-
----
-
-## ☁️ Cloud Scheduling (GitHub Actions)
-
-Runs headless every 4 days — no laptop needed. See `GITHUB_ACTIONS_SETUP.md`.
-
-- Workflow: `.github/workflows/auto_post.yml:12` — Daily cron (`0 9 * * *`) with `day_of_year % 4 == 0` check (09:00 UTC), plus `workflow_dispatch` for manual trigger
-- Runner: `ubuntu-latest` + Python `3.12`
-- Secrets: `GEMINI_API_KEY`, `LINKEDIN_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_KEY` (Repo → Settings → Secrets and variables → Actions)
-- Persistence: workflow commits history back to survive ephemeral runners; `_seed_from_history()` (`linkedin_pipeline.py:91`) rehydrates ChromaDB each run
+Run LinkedIn OAuth once if you do not already have `LINKEDIN_TOKEN`:
 
 ```bash
-git init && git add . && git commit -m "Initial commit"
-git branch -M main && git remote add origin https://github.com/DharamVeer970/LinkedIN_Post_Automation.git
-git push -u origin main
-# Add 4 secrets in GitHub → watch Actions tab → Run workflow
+python linkedin_poster.py
 ```
 
----
+Run the full pipeline:
 
-## 🎛️ Customization
+```bash
+python linkedin_pipeline.py
+```
 
-All prompts & domains live in **`post_prompts.py`** — edit that file only:
+Generated images are saved in `images/`.
 
-- **Topics:** `TOPIC_DOMAINS` (`post_prompts.py:13`) — add RSS `feeds` or `evergreen` strings. Auto-aggregated via `ALL_RSS_FEEDS` / `ALL_EVERGREEN_TOPICS`.
-- **Caption style:** `content_prompt()` (`post_prompts.py:252`) — hook, 3-4 punchy paras, 5-7 emojis, woven hashtags, final hashtag line.
-- **Critic rules:** `critique_prompt()` / `CLICHES` (`linkedin_pipeline.py:287`) — quality gate `QUALITY_GATE=7` (`linkedin_pipeline.py:71`).
-- **Image styles:** `VIRAL_TEMPLATES` (`post_prompts.py:190`) + `image_prompt_gen()` (`post_prompts.py:308`).
+## Environment Variables
 
----
+| Variable | Required | Purpose |
+|---|---:|---|
+| `GEMINI_API_KEY` | yes | Gemini text generation and Gemini Vision QA |
+| `LINKEDIN_TOKEN` | yes | LinkedIn posting token |
+| `CLOUDFLARE_ACCOUNT_ID` | yes | Cloudflare account ID for Workers AI |
+| `CLOUDFLARE_API_KEY` | yes | Cloudflare API token with Workers AI access |
+| `CLIENT_ID` | once | LinkedIn OAuth setup |
+| `CLIENT_SECRET` | once | LinkedIn OAuth setup |
 
-## 🔧 Troubleshooting
+## Cloudflare Token
+
+Create an API token in Cloudflare with Workers AI access.
+
+Common failures:
+
+- `401` or `403`: token is wrong or missing permission.
+- `7003` or `7000`: account ID is wrong.
+- Daily neuron limit: wait for reset or upgrade Cloudflare plan.
+
+## LinkedIn Token
+
+`linkedin_poster.py` handles the one-time OAuth flow.
+
+The token expires, so if posting starts failing with authorization errors, rerun:
+
+```bash
+python linkedin_poster.py
+```
+
+Then update `.env` and GitHub Secrets.
+
+## GitHub Actions Scheduling
+
+The workflow lives at:
+
+```text
+.github/workflows/auto_post.yml
+```
+
+For a full cloud setup walkthrough, refer to [`GITHUB_ACTIONS_SETUP.md`](GITHUB_ACTIONS_SETUP.md).
+
+It runs daily at 09:00 UTC, then checks:
+
+```bash
+day_of_year % 4 == 0
+```
+
+That gives a true every-4-days cadence. You can also run it manually with `workflow_dispatch`.
+
+Required GitHub Secrets:
+
+```text
+GEMINI_API_KEY
+LINKEDIN_TOKEN
+CLOUDFLARE_ACCOUNT_ID
+CLOUDFLARE_API_KEY
+```
+
+The workflow commits `posts_history.json` back to the repo so duplicate detection survives fresh GitHub Actions runners.
+
+## Customization
+
+Edit `post_prompts.py` for:
+
+- `TOPIC_DOMAINS`: RSS feeds and evergreen topic lists.
+- `content_prompt()`: LinkedIn writing style.
+- `critique_prompt()`: post quality rules.
+- `image_prompt_gen()`: image prompt behavior.
+- `VISUAL_DIRECTIONS`: the 15 rotating image styles.
+- `image_qa_prompt()`: spelling, layout, and relevance checks.
+
+Edit `linkedin_pipeline.py` for:
+
+- `GEMINI_MODELS`
+- `QUALITY_GATE`
+- `MAX_REVISIONS`
+- `MAX_RETRIES`
+- `CF_MODELS`
+- `IMAGE_QA_MAX_ATTEMPTS`
+- `TEXT_FREE_IMAGE_ATTEMPTS`
+- image fallback behavior
+
+Edit `linkedin_poster.py` only if LinkedIn API payloads or API versions change.
+
+## Local Checks
+
+Syntax check:
+
+```bash
+python -m py_compile linkedin_pipeline.py post_prompts.py linkedin_poster.py
+```
+
+Safe import check:
+
+```bash
+python -W default -c "import linkedin_pipeline; print('ok')"
+```
+
+Full run posts to LinkedIn, so only run this when you are ready:
+
+```bash
+python linkedin_pipeline.py
+```
+
+## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `GEMINI_API_KEY or LINKEDIN_TOKEN missing` | Check `.env` exists and is loaded (`load_dotenv()`); on Actions check Secrets names match exactly |
-| `Cloudflare ... error 401/403` | Wrong/expired API token — create one at dash.cloudflare.com/profile/api-tokens with **Workers AI: Edit** permission |
-| `Cloudflare ... error 7003/7000` (no route) | Wrong `CLOUDFLARE_ACCOUNT_ID` — copy it from Workers & Pages sidebar |
-| `429 Gemini` / `model not found` | Pipeline auto-retries with jitter, then falls back across `GEMINI_MODELS`. If persistent, wait for quota reset |
-| `Cloudflare 429: daily free allocation of neurons` | Workers AI free tier = 10,000 neurons/day (resets midnight PT). Each image costs neurons; QA retries cost more. Wait for reset or upgrade to Workers Paid |
-| `Not authorized / Invalid token` | LinkedIn token expired (~60d). Re-run `python linkedin_poster.py` and update `.env` + GitHub Secret `LINKEDIN_TOKEN` |
-| ChromaDB empty on Actions | Ensure `posts_history.json` is committed — `_seed_from_history()` needs it |
-| Image text gibberish | Fixed: images are text-free, PIL overlays perfect text |
+| `GEMINI_API_KEY` or `LINKEDIN_TOKEN` missing | Check `.env` locally or GitHub Secrets in Actions. |
+| Gemini `429` | Wait for quota reset or rely on model fallback. |
+| Cloudflare `401/403` | Recreate token with Workers AI access. |
+| Cloudflare `7003/7000` | Copy the correct Cloudflare account ID. |
+| Image text is misspelled | Pipeline retries, then switches to text-free image. |
+| Image is still unrelated or bad | Pipeline posts text-only. |
+| LinkedIn token expired | Rerun `python linkedin_poster.py`. |
+| ChromaDB empty in Actions | Commit `posts_history.json`; ChromaDB is rebuilt from it. |
+| Warning about `allowed_objects` | Suppressed in `linkedin_pipeline.py`. |
 
----
+## Git Notes
 
-> Built with Gemini • Cloudflare Workers AI • LangGraph • ChromaDB • LinkedIn API v202608 (`linkedin_poster.py:14`)
+Keep these out of git:
+
+```text
+.env
+images/
+post_history_db/
+```
+
+Keep this in git:
+
+```text
+posts_history.json
+```
+
+`posts_history.json` is what lets scheduled GitHub Actions runs remember previous posts.
