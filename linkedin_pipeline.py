@@ -71,9 +71,8 @@ if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_KEY:
     print("[warn] CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY not found in .env - image generation will fail.")
 
 
-# Gemini models in priority order: flash for quality, lite as quota fallback.
-
-GEMINI_MODELS = ("gemini-3.6-flash", "gemini-3.1-flash-lite")
+# Gemini models in priority order: stable flash for quality, lite as fallback.
+GEMINI_MODELS = ("gemini-3.7-flash", "gemini-3.1-flash-lite")
 SIMILARITY_THRESHOLD = 0.85                    # anything above this similarity is treated as duplicate
 MAX_RETRIES = 3                                # how many times to retry with a new topic if duplicate found
 MAX_REVISIONS = 2                              # how many times the critic loop may revise a weak draft
