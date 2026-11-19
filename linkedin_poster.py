@@ -2,6 +2,7 @@
 LinkedIn Automation - OAuth + Posting Script
 Post text + images automatically to a personal LinkedIn profile.
 """
+import base64
 import os
 import requests
 from dotenv import load_dotenv
@@ -18,6 +19,7 @@ def _check(resp: requests.Response) -> None:
     if not resp.ok:
         print("---- LinkedIn error response ----")
         print("Status:", resp.status_code)
+        print("Headers:", dict(resp.headers))
         print("Body:", resp.text)
         print("----------------------------------")
     resp.raise_for_status()
@@ -36,6 +38,10 @@ def get_authorization_url() -> str:
 def exchange_code_for_token(auth_code: str) -> str:
     """Swap the callback 'code' for an access token."""
     url = "https://www.linkedin.com/oauth/v2/accessToken"
+    # Build Basic Auth header for client credentials (LinkedIn OAuth requirement)
+    credentials = f"{CLIENT_ID}:{CLIENT_SECRET}".encode("ascii")
+    basic_auth = base64.b64encode(credentials).decode("ascii")
+
     payload = {
         "grant_type": "authorization_code",
         "code": auth_code,
@@ -43,7 +49,15 @@ def exchange_code_for_token(auth_code: str) -> str:
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
     }
-    resp = requests.post(url, data=payload)
+
+    resp = requests.post(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {basic_auth}",
+        },
+    )
     _check(resp)
     data = resp.json()
     return data["access_token"]  # Token lasts ~60 days; store it and add a refresh flow.
@@ -112,14 +126,20 @@ def create_post(access_token: str, person_urn: str, text: str, image_urn: str | 
 
 
 if __name__ == "__main__":
+    import sys
     # One-time authorization flow - run these lines only once.
     if not CLIENT_ID or not CLIENT_SECRET:
         raise ValueError("Set CLIENT_ID and CLIENT_SECRET in your .env file first")
     print("Authorize here:", get_authorization_url())
-    auth_code = input("Paste the 'code' from the redirect URL: ")
+    
+    # Accept auth code from command line argument or stdin
+    if len(sys.argv) > 1:
+        auth_code = sys.argv[1]
+    else:
+        auth_code = input("Paste the 'code' from the redirect URL: ")
+    
     token = exchange_code_for_token(auth_code)
     print("ACCESS TOKEN (copy this into .env as LINKEDIN_TOKEN):", token)
-    exit()  # Only need the token for now - the test-post code below will not run.
 
     # Daily automation continues from here, reusing the saved token.
     person_urn = get_person_urn(token)

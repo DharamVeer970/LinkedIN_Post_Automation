@@ -37,6 +37,7 @@ TOPIC_DOMAINS = {
             "Tool use: how LLMs call external tools and APIs",
             "Multi-agent orchestration: coordinating agents for complex tasks",
             "The ethics of AI agents: responsibility, bias, and safety",
+            "All latest Updates about the AI and Quantum Computing",
         ],
     },
     "Software & Automation": {
@@ -107,26 +108,9 @@ TOPIC_DOMAINS = {
             "https://hnrss.org/frontpage",
         ],
         "evergreen": [
-            "Deep work: why focus is the new superpower",
-            "Career advice nobody tells early engineers",
             "How to learn hard things twice as fast",
-            "Managing energy, not time: a practical system",
             "Saying no: the highest-leverage skill at work",
-            "From individual contributor to leader: real lessons",
             "The 80/20 rule in career growth: what to focus on",
-        ],
-    },
-    "Psychology & Mind": {
-        "feeds": [],
-        "evergreen": [
-            "The psychology of habits: why willpower fails",
-            "Imposter syndrome: what it really is and isn't",
-            "Why smart people make bad decisions under stress",
-            "The dopamine trap: phones, feeds and focus",
-            "Cognitive biases that shape your daily choices",
-            "How curiosity rewires the brain for learning",
-            "The science of motivation: intrinsic vs extrinsic",
-            "Mindfulness and productivity: separating hype from science",
         ],
     },
     "Science & Future": {
@@ -162,12 +146,6 @@ TOPIC_DOMAINS = {
     "Money & Investing": {
         "feeds": [],
         "evergreen": [
-            "Compound interest: the math nobody feels until it's late",
-            "Index funds vs stock picking: an honest comparison",
-            "Lifestyle inflation: the silent wealth killer",
-            "Skills that pay forever in any economy",
-            "The psychology of spending: why we buy",
-            "Side income myths vs what actually works",
             "The FIRE movement: financial independence, retire early",
             "In this ERA of AI, what skills will retain value?",
         ],
