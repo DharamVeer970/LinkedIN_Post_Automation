@@ -57,9 +57,6 @@ from post_prompts import (
     image_qa_prompt,
 )
 
-# linkedin_poster.py must exist in the same folder; posting functions are imported from there
-from linkedin_poster import get_person_urn, register_image_upload, upload_image_binary, create_post
-
 # ---- CONFIG: loaded from the .env file (create .env in this folder) ----
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -71,12 +68,18 @@ if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_KEY:
     print("[warn] CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_KEY not found in .env - image generation will fail.")
 
 
-# Gemini models in priority order: stable flash for quality, lite as fallback.
-GEMINI_MODELS = ("gemini-3.7-flash", "gemini-3.1-flash-lite")
+# Gemini models in priority order: quality first, then higher-throughput fallbacks.
+GEMINI_MODELS = (
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.1-flash-lite",
+)
 SIMILARITY_THRESHOLD = 0.85                    # anything above this similarity is treated as duplicate
 MAX_RETRIES = 3                                # how many times to retry with a new topic if duplicate found
 MAX_REVISIONS = 2                              # how many times the critic loop may revise a weak draft
 QUALITY_GATE = 7                               # post must score at least this to skip revision
+LINKEDIN_API_VERSION = "202608"
 
 # ---- Gemini API call settings (free-tier rate-limit protection) ----
 MODEL_MAX_RETRIES = 2                          # retries per model before switching to the next model
@@ -86,6 +89,82 @@ API_PACE_DELAY = 5.0                           # min seconds between consecutive
 
 if not GEMINI_API_KEY or not LINKEDIN_TOKEN:
     raise ValueError("Set GEMINI_API_KEY and LINKEDIN_TOKEN in your .env file (see .env.example)")
+
+
+# ---- LinkedIn publishing helpers (kept here so linkedin_poster.py is token-only) ----
+def _linkedin_check(response: requests.Response) -> None:
+    """Raise an HTTP error with enough response context to diagnose it."""
+    if not response.ok:
+        print("[linkedin] error", response.status_code, response.text)
+    response.raise_for_status()
+
+
+def get_person_urn(access_token: str) -> str:
+    response = requests.get(
+        "https://api.linkedin.com/v2/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    _linkedin_check(response)
+    return f"urn:li:person:{response.json()['sub']}"
+
+
+def register_image_upload(access_token: str, person_urn: str) -> tuple[str, str]:
+    response = requests.post(
+        "https://api.linkedin.com/rest/images?action=initializeUpload",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "LinkedIn-Version": LINKEDIN_API_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+        json={"initializeUploadRequest": {"owner": person_urn}},
+        timeout=30,
+    )
+    _linkedin_check(response)
+    value = response.json()["value"]
+    return value["uploadUrl"], value["image"]
+
+
+def upload_image_binary(upload_url: str, image_path: str, access_token: str) -> None:
+    with open(image_path, "rb") as image_file:
+        response = requests.put(
+            upload_url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            data=image_file,
+            timeout=60,
+        )
+    _linkedin_check(response)
+
+
+def create_post(access_token: str, person_urn: str, text: str, image_urn: str | None = None) -> str:
+    body = {
+        "author": person_urn,
+        "commentary": text,
+        "visibility": "PUBLIC",
+        "distribution": {
+            "feedDistribution": "MAIN_FEED",
+            "targetEntities": [],
+            "thirdPartyDistributionChannels": [],
+        },
+        "lifecycleState": "PUBLISHED",
+        "isReshareDisabledByAuthor": False,
+    }
+    if image_urn:
+        body["content"] = {"media": {"id": image_urn}}
+    response = requests.post(
+        "https://api.linkedin.com/rest/posts",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "LinkedIn-Version": LINKEDIN_API_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+        json=body,
+        timeout=30,
+    )
+    _linkedin_check(response)
+    return response.headers.get("x-restli-id", "unknown")
 
 # ---- ChromaDB setup — old posts are stored here for uniqueness checking ----
 # NOTE: chroma.sqlite3 + .bin files are NOT git-friendly and get lost on the ephemeral GitHub Actions runner.
